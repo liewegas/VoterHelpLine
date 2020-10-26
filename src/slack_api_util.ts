@@ -72,9 +72,11 @@ export async function getThreadPermalink(
     throw error;
   }
 }
+
 function delay(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
+
 export async function makeFilesPublic(files: SlackFile[]): Promise<string[]> {
   const errors = [] as string[];
   for (const file of files) {
@@ -97,30 +99,44 @@ export async function makeFilesPublic(files: SlackFile[]): Promise<string[]> {
       continue;
     }
 
-    await delay(2000);
-
-    // then make it public
-    response = await axios.post(
-      'https://slack.com/api/files.sharedPublicURL',
-      null,
-      {
-        params: {
-          file: file.id,
-          token: process.env.SLACK_USER_ACCESS_TOKEN,
-        },
+    let tries = 0;
+    for (;;) {
+      // then make it public
+      response = await axios.post(
+        'https://slack.com/api/files.sharedPublicURL',
+        null,
+        {
+          params: {
+            file: file.id,
+            token: process.env.SLACK_USER_ACCESS_TOKEN,
+          },
+        }
+      );
+      if (response.data.ok || response.data.error === 'already_public') {
+        logger.info(
+          `SLACKAPIUTIL.makeFilesPublic: successfully made ${file.id} public`
+        );
+        break;
       }
-    );
-    if (!response.data.ok) {
-      errors.push('Unable to make attachment public');
-      logger.error(
-        `SLACKAPIUTIL.makeFilesPublic: Failed with ${JSON.stringify(
+
+      tries++;
+      if (tries == 5) {
+        errors.push('Unable to make attachment public');
+        logger.error(
+          `SLACKAPIUTIL.makeFilesPublic: Failed again, giving up, with ${JSON.stringify(
+            response.data
+          )}`
+        );
+        break;
+      }
+      logger.warn(
+        `SLACKAPIUTIL.makeFilesPublic: Failed on attempt ${tries} with ${JSON.stringify(
           response.data
         )}`
       );
-    } else {
-      logger.info(
-        `SLACKAPIUTIL.makeFilesPublic: successfully made ${file.id} public`
-      );
+
+      // wait and then try again
+      await delay(1000);
     }
   }
   return errors;
