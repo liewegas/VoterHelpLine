@@ -1,4 +1,3 @@
-import axios from 'axios';
 import { voterStatusPanel, SlackBlock } from './slack_block_util';
 import logger from './logger';
 import { UserInfo } from './types';
@@ -17,29 +16,21 @@ export async function replaceSlackMessageBlocks({
 }): Promise<void> {
   logger.info('ENTERING SLACKINTERACTIONAPIUTIL.replaceSlackMessageBlocks');
   // Replace voter status panel with message.
-  const response = await axios.post(
-    'https://slack.com/api/chat.update',
-    {
-      'Content-Type': 'application/json',
-      channel: slackChannelId,
-      token: process.env.SLACK_BOT_ACCESS_TOKEN,
-      ts: slackParentMessageTs,
-      blocks: newBlocks,
-    },
-    {
-      headers: {
-        Authorization: `Bearer ${process.env.SLACK_BOT_ACCESS_TOKEN}`,
-      },
-    }
-  );
-
+  const response = await SlackApiUtil.slackAPI.post('chat.update', {
+    channel: slackChannelId,
+    token: process.env.SLACK_BOT_ACCESS_TOKEN,
+    ts: slackParentMessageTs,
+    blocks: newBlocks,
+  });
   if (response.data.ok) {
     logger.info(
       `SLACKINTERACTIONAPIUTIL.replaceSlackMessageBlock: Successfully replaced Slack message block`
     );
   } else {
     logger.error(
-      `SLACKINTERACTIONAPIUTIL.replaceSlackMessageBlock: ERROR in replacing Slack message block: ${response.data.error}`
+      `SLACKINTERACTIONAPIUTIL.replaceSlackMessageBlock: ERROR in replacing Slack message block: ${JSON.stringify(
+        response.data
+      )}`
     );
   }
 }
@@ -64,6 +55,37 @@ export function addBackVoterStatusPanel({
     slackChannelId,
     slackParentMessageTs,
     newBlocks,
+  });
+}
+
+export async function updateVoterStatusBlocks(
+  channelId: string,
+  parentMessageTs: string,
+  blocks: SlackBlock[]
+): Promise<void> {
+  // HACK: work around slack bug updating blocks: we must first remove the dropdown before we change it
+  const oldBlock = blocks[2];
+  blocks[2] = {
+    type: 'section',
+    block_id: 'asdf',
+    text: {
+      type: 'mrkdwn',
+      text: 'Updating...',
+      verbatim: false,
+    },
+  };
+  await replaceSlackMessageBlocks({
+    slackChannelId: channelId,
+    slackParentMessageTs: parentMessageTs,
+    newBlocks: blocks,
+  });
+  blocks[2] = oldBlock;
+
+  // Replace the entire block so that the initial option change persists.
+  await replaceSlackMessageBlocks({
+    slackChannelId: channelId,
+    slackParentMessageTs: parentMessageTs,
+    newBlocks: blocks,
   });
 }
 

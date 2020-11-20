@@ -33,8 +33,18 @@ const requireModules = () => {
   SlackApiUtil.fetchSlackMessageBlocks = jest.fn();
   SlackInteractionApiUtil.replaceSlackMessageBlocks = jest.fn();
   RedisApiUtil.setHash = jest.fn();
+  RedisApiUtil.getKey = jest.fn();
   DbApiUtil.getMessageHistoryFor = jest.fn();
   DbApiUtil.logVoterStatusToDb = jest.fn();
+  DbApiUtil.logInitialVoterStatusToDb = jest.fn();
+  DbApiUtil.logThreadToDb = jest.fn();
+  DbApiUtil.setThreadNeedsAttentionToDb = jest.fn();
+  DbApiUtil.getThreadNeedsAttentionFor = jest.fn();
+  DbApiUtil.setThreadHistoryTs = jest.fn();
+  DbApiUtil.updateThreadStatusFromMessage = jest.fn();
+  DbApiUtil.getLatestVoterStatus = jest.fn();
+  DbApiUtil.setThreadInactive = jest.fn();
+
   SlackBlockUtil.populateDropdownWithLatestVoterStatus = jest.fn();
 };
 
@@ -66,10 +76,15 @@ const expectNthSlackMessageToChannel = (
       channelMessageNum++;
       if (channelMessageNum == n) {
         const slackMessage = SlackApiUtil.sendMessage.mock.calls[i][0];
+        const slackOpts = SlackApiUtil.sendMessage.mock.calls[i][1];
         for (let j = 0; j < messageParts.length; j++) {
-          expect(slackMessage).toEqual(
-            expect.stringContaining(messageParts[j])
-          );
+          if (typeof messageParts[j] === 'string') {
+            expect(slackMessage).toEqual(
+              expect.stringContaining(messageParts[j])
+            );
+          } else {
+            expect(slackOpts).toEqual(expect.objectContaining(messageParts[j]));
+          }
         }
         if (parentMessageTs) {
           expect(slackMessageParams).toEqual(
@@ -139,7 +154,7 @@ describe('handleNewVoter', () => {
   });
 
   test('Announces new voter message in Slack', () => {
-    expect(SlackApiUtil.sendMessage.mock.calls[0][0]).toContain('New voter');
+    expect(SlackApiUtil.sendMessage.mock.calls[0][0]).toContain('User ID');
   });
 
   test('Announces new voter message to Slack #lobby channel if non-demo line', () => {
@@ -170,17 +185,17 @@ describe('handleNewVoter', () => {
     });
   });
 
-  test('Includes truncated user id in new voter announcement in Slack', () => {
-    const MD5 = new Hashes.MD5();
-    const userId = MD5.hex('+1234567890');
-    expect(SlackApiUtil.sendMessage.mock.calls[0][0]).toContain(
-      userId.substring(0, 5)
-    );
-  });
-
   test('Relays voter message in subsequent message to Slack', () => {
-    expect(SlackApiUtil.sendMessage.mock.calls[1][0]).toEqual(
-      expect.stringContaining('can you help me vote')
+    expect(SlackApiUtil.sendMessage.mock.calls[1][1]).toEqual(
+      expect.objectContaining({
+        blocks: [
+          expect.objectContaining({
+            text: expect.objectContaining({
+              text: 'can you help me vote',
+            }),
+          }),
+        ],
+      })
     );
     expect(SlackApiUtil.sendMessage.mock.calls[1][1]).toEqual(
       expect.objectContaining({
@@ -207,14 +222,6 @@ describe('handleNewVoter', () => {
       userInfo.lastVoterMessageSecsFromEpoch;
     expect(newLastVoterMessageSecsFromEpoch - secsFromEpochNow).toBeLessThan(
       10
-    );
-  });
-
-  test('Includes truncated user id in relay of voter message', () => {
-    const MD5 = new Hashes.MD5();
-    const userId = MD5.hex('+1234567890');
-    expect(SlackApiUtil.sendMessage.mock.calls[1][0]).toEqual(
-      expect.stringContaining(userId.substring(0, 5))
     );
   });
 
@@ -479,16 +486,16 @@ describe('determineVoterState', () => {
       );
     });
     test('Passes voter message to Slack', () => {
-      expect(SlackApiUtil.sendMessage.mock.calls[0][0]).toContain(
-        'nonsensical statement'
-      );
-    });
-
-    test('Includes truncated user id in passing voter message to Slack', () => {
-      const MD5 = new Hashes.MD5();
-      const userId = MD5.hex('+1234567890');
-      expect(SlackApiUtil.sendMessage.mock.calls[0][0]).toContain(
-        userId.substring(0, 5)
+      expect(SlackApiUtil.sendMessage.mock.calls[0][1]).toEqual(
+        expect.objectContaining({
+          blocks: [
+            expect.objectContaining({
+              text: expect.objectContaining({
+                text: 'nonsensical statement',
+              }),
+            }),
+          ],
+        })
       );
     });
 
@@ -730,9 +737,7 @@ describe('determineVoterState', () => {
         inboundDbMessageEntry
       ).then(() => {
         expect(TwilioApiUtil.sendMessage.mock.calls[0][0]).toEqual(
-          expect.stringMatching(
-            /Great!.*We try to reply within minutes but may take 24 hours./i
-          )
+          expect.stringMatching(/Great!.*will be with you shortly/i)
         );
         expect(TwilioApiUtil.sendMessage.mock.calls[0][1]).toEqual(
           expect.objectContaining({
@@ -798,7 +803,17 @@ describe('determineVoterState', () => {
         expectNthSlackMessageToChannel(
           'CTHELOBBYID',
           0,
-          ['NC'],
+          [
+            {
+              blocks: [
+                expect.objectContaining({
+                  text: expect.objectContaining({
+                    text: 'NC',
+                  }),
+                }),
+              ],
+            },
+          ],
           '293874928374'
         );
       });
@@ -818,7 +833,7 @@ describe('determineVoterState', () => {
         expectNthSlackMessageToChannel(
           'CTHELOBBYID',
           1,
-          ['We try to reply within minutes but may take 24 hours.'],
+          ['will be with you shortly'],
           '293874928374'
         );
       });
@@ -1161,11 +1176,15 @@ describe('handleDisclaimer', () => {
     });
 
     test('Passes voter message to Slack lobby channel', () => {
-      expect(SlackApiUtil.sendMessage.mock.calls[0][0]).toContain(
-        'response to state question'
-      );
       expect(SlackApiUtil.sendMessage.mock.calls[0][1]).toEqual(
         expect.objectContaining({
+          blocks: [
+            expect.objectContaining({
+              text: expect.objectContaining({
+                text: 'response to state question',
+              }),
+            }),
+          ],
           parentMessageTs: '293874928374',
           channel: 'CTHELOBBYID',
         })
@@ -1494,8 +1513,16 @@ describe('handleClearedVoter', () => {
       twilioPhoneNumber,
       inboundDbMessageEntry
     ).then(() => {
-      expect(SlackApiUtil.sendMessage.mock.calls[0][0]).toContain(
-        'subsequent message'
+      expect(SlackApiUtil.sendMessage.mock.calls[0][1]).toEqual(
+        expect.objectContaining({
+          blocks: [
+            expect.objectContaining({
+              text: expect.objectContaining({
+                text: 'subsequent message',
+              }),
+            }),
+          ],
+        })
       );
     });
   });
@@ -1569,11 +1596,11 @@ describe('handleClearedVoter', () => {
     });
   });
 
-  test("Sends voter a welcome back text if it's been longer than 1 hour", () => {
+  test("Sends voter a welcome back text if it's been longer than 24 hours", () => {
     expect.assertions(2);
-    const oneHourAndOneMinInSecs = 60 * 60 + 60;
+    const twentyFourHoursAndOneMinInSecs = 60 * 60 * 24 + 60;
     const mockLastVoterMessageSecsFromEpoch = Math.round(
-      Date.now() / 1000 - oneHourAndOneMinInSecs
+      Date.now() / 1000 - twentyFourHoursAndOneMinInSecs
     );
     const userInfo = {
       activeChannelId: 'CNORTHCAROLINACHANNELID',

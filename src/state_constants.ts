@@ -20,7 +20,6 @@ export function getStateConstants(): { [stateCode: string]: string } {
         KS: 'Kansas',
         KY: 'Kentucky',
         LA: 'Louisiana',
-        ME: 'Maine',
         MD: 'Maryland',
         MA: 'Massachusetts',
         MI: 'Michigan',
@@ -37,7 +36,6 @@ export function getStateConstants(): { [stateCode: string]: string } {
         NC: 'North Carolina',
         ND: 'North Dakota',
         OH: 'Ohio',
-        OR: 'Oregon',
         PA: 'Pennsylvania',
         RI: 'Rhode Island',
         SC: 'South Carolina',
@@ -46,13 +44,15 @@ export function getStateConstants(): { [stateCode: string]: string } {
         TX: 'Texas',
         UT: 'Utah',
         VT: 'Vermont',
+        WV: 'West Virginia',
         VA: 'Virginia',
         WA: 'Washington',
-        WV: 'West Virginia',
         WI: 'Wisconsin',
         WY: 'Wyoming',
         IN: 'Indiana',
         OK: 'Oklahoma',
+        ME: 'Maine',
+        OR: 'Oregon',
       };
     case 'VOTER_HELP_LINE':
       return {

@@ -2,6 +2,7 @@ import type express from 'express';
 
 export type MessageDirection = 'INBOUND' | 'OUTBOUND';
 export type EntryPoint = 'PULL' | 'PUSH';
+export type ChannelType = 'DEMO' | 'NORMAL';
 export type VoterStatus =
   | 'UNKNOWN'
   | 'UNREGISTERED'
@@ -40,6 +41,8 @@ export type HistoricalMessage = {
   automated: boolean;
   direction: MessageDirection;
   originating_slack_user_name: string;
+  slack_attachments: { id: string; permalink: string }[] | null;
+  twilio_attachments: string[] | null;
 };
 
 export type SlackThreadInfo = {

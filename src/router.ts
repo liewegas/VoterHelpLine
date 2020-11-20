@@ -10,18 +10,22 @@ import * as RedisApiUtil from './redis_api_util';
 import * as LoadBalancer from './load_balancer';
 import * as SlackMessageFormatter from './slack_message_formatter';
 import * as CommandUtil from './command_util';
-import MessageParser from './message_parser';
+import * as MessageParser from './message_parser';
 import * as SlackInteractionApiUtil from './slack_interaction_api_util';
 import logger from './logger';
 import { EntryPoint, UserInfo } from './types';
 import { PromisifiedRedisClient } from './redis_client';
 import * as Sentry from '@sentry/node';
+import { isVotedKeyword } from './keyword_parser';
+import { SlackActionId } from './slack_interaction_ids';
+import { SlackFile } from './message_parser';
 
-const MINS_BEFORE_WELCOME_BACK_MESSAGE = 60;
+const MINS_BEFORE_WELCOME_BACK_MESSAGE = 60 * 24;
 export const NUM_STATE_SELECTION_ATTEMPTS_LIMIT = 2;
 
 type UserOptions = {
   userMessage: string;
+  userAttachments: string[];
   userPhoneNumber: string;
 };
 
@@ -49,7 +53,7 @@ function prepareUserInfoForNewVoter({
       userOptions.userPhoneNumber
     );
     logger.debug(
-      `ROUTER.handleNewVoter (${userOptions.userId}): Evaluating isDemo based on userPhoneNumber/twilioPhoneNumber: ${isDemo}`
+      `ROUTER.prepareUserInfoForNewVoter (${userOptions.userId}): Evaluating isDemo based on userPhoneNumber/twilioPhoneNumber: ${isDemo}`
     );
     confirmedDisclaimer = false;
     volunteerEngaged = false;
@@ -86,8 +90,25 @@ export async function welcomePotentialVoter(
     entryPoint,
   });
 
+  let messageToVoter = MessageConstants.WELCOME_VOTER();
+  if (isVotedKeyword(userOptions.userMessage)) {
+    messageToVoter = MessageConstants.VOTED_WELCOME_RESPONSE();
+    await DbApiUtil.logVoterStatusToDb({
+      userId: userInfo.userId,
+      userPhoneNumber: userInfo.userPhoneNumber,
+      twilioPhoneNumber: twilioPhoneNumber,
+      isDemo: userInfo.isDemo,
+      voterStatus: 'VOTED',
+      originatingSlackUserName: null,
+      originatingSlackUserId: null,
+      slackChannelName: null,
+      slackChannelId: null,
+      slackParentMessageTs: null,
+      actionTs: null,
+    });
+  }
   await TwilioApiUtil.sendMessage(
-    MessageConstants.WELCOME_VOTER(),
+    messageToVoter,
     {
       userPhoneNumber: userOptions.userPhoneNumber,
       twilioPhoneNumber,
@@ -123,13 +144,19 @@ export async function welcomePotentialVoter(
 }
 
 const introduceNewVoterToSlackChannel = async (
-  { userInfo, userMessage }: { userInfo: UserInfo; userMessage: string },
+  {
+    userInfo,
+    userMessage,
+    userAttachments,
+  }: { userInfo: UserInfo; userMessage: string; userAttachments: string[] },
   redisClient: PromisifiedRedisClient,
   twilioPhoneNumber: string,
   inboundDbMessageEntry: DbApiUtil.DatabaseMessageEntry,
   entryPoint: EntryPoint,
   slackChannelName: string,
-  twilioCallbackURL: string
+  twilioCallbackURL: string,
+  // This is only used by VOTE_AMERICA
+  includeWelcome?: boolean
 ) => {
   logger.debug('ENTERING ROUTER.introduceNewVoterToSlackChannel');
   logger.debug(
@@ -140,18 +167,50 @@ const introduceNewVoterToSlackChannel = async (
     `ROUTER.introduceNewVoterToSlackChannel: Announcing new voter via new thread in ${slackChannelName}.`
   );
   // In Slack, create entry channel message, followed by voter's message and intro text.
-  const operatorMessage = `<!channel> New voter!\n*User ID:* ${userInfo.userId}\n*Connected via:* ${twilioPhoneNumber} (${entryPoint})`;
+  const operatorMessage = `*User ID:* ${userInfo.userId}\n*Connected via:* ${twilioPhoneNumber} (${entryPoint})`;
 
   const slackBlocks = SlackBlockUtil.getVoterStatusBlocks(operatorMessage);
 
-  const response = await SlackApiUtil.sendMessage(operatorMessage, {
-    channel: slackChannelName,
-    blocks: slackBlocks,
-  });
+  // If the voter has previously communicated that they already voted, we have them
+  // enter the helpline with "Already Voted" prepopulated as their status.
+  const status = await DbApiUtil.getLatestVoterStatus(
+    userInfo.userId,
+    twilioPhoneNumber
+  );
+  if (status === 'VOTED') {
+    SlackBlockUtil.populateDropdownNewInitialValue(
+      slackBlocks,
+      SlackActionId.VOTER_STATUS_DROPDOWN,
+      status
+    );
+  }
+
+  const skipLobby =
+    (await RedisApiUtil.getKey(redisClient, 'skipLobby')) === 'true';
+
+  let response = {
+    data: {
+      channel: 'NONEXISTENT_LOBBY',
+      ts: 'NONEXISTENT_LOBBY_TS',
+    },
+  } as SlackApiUtil.SlackSendMessageResponse | null;
+
+  if (slackChannelName !== 'lobby' || !skipLobby) {
+    response = await SlackApiUtil.sendMessage(operatorMessage, {
+      channel: slackChannelName,
+      blocks: slackBlocks,
+    });
+  }
 
   let messageToVoter;
   if (process.env.CLIENT_ORGANIZATION === 'VOTE_AMERICA') {
-    messageToVoter = MessageConstants.STATE_QUESTION();
+    if (includeWelcome) {
+      // Voter initiated conversation with "HELPLINE".
+      messageToVoter = MessageConstants.WELCOME_AND_STATE_QUESTION();
+    } else {
+      // Voter has already received automated welcome and is just now responding with "HELPLINE".
+      messageToVoter = MessageConstants.STATE_QUESTION();
+    }
   } else {
     messageToVoter = MessageConstants.WELCOME_VOTER();
   }
@@ -195,6 +254,19 @@ const introduceNewVoterToSlackChannel = async (
   // using the ID version of the channel.
   userInfo[response.data.channel] = response.data.ts;
 
+  // Create the thread
+  if (!skipLobby) {
+    await DbApiUtil.logThreadToDb({
+      slackParentMessageTs: response.data.ts,
+      channelId: response.data.channel,
+      userId: userInfo.userId,
+      userPhoneNumber: userInfo.userPhoneNumber,
+      twilioPhoneNumber: twilioPhoneNumber,
+      needsAttention: true,
+      isDemo: userInfo.isDemo,
+    });
+  }
+
   // Set active channel to this first channel, since the voter is new.
   // Makes sure subsequent messages from the voter go to this channel, unless
   // this active channel is changed.
@@ -232,25 +304,37 @@ const introduceNewVoterToSlackChannel = async (
 
     const messageHistoryContextText =
       "Below is the voter's message history so far.";
-    await postUserMessageHistoryToSlack(
-      userInfo.userId,
-      '1990-01-01 10:00:00.000',
-      messageHistoryContextText,
-      {
-        destinationSlackParentMessageTs: response.data.ts,
-        destinationSlackChannelId: response.data.channel,
-      }
-    );
+    if (slackChannelName !== 'lobby' || !skipLobby) {
+      await postUserMessageHistoryToSlack(
+        userInfo.userId,
+        twilioPhoneNumber,
+        '1990-01-01 10:00:00.000',
+        messageHistoryContextText,
+        {
+          destinationSlackParentMessageTs: response.data.ts,
+          destinationSlackChannelId: response.data.channel,
+        }
+      );
+    }
   } else if (entryPoint === LoadBalancer.PULL_ENTRY_POINT) {
     // Pass the voter's message along to the initial Slack channel thread,
-    // and show in the Slack  thread the welcome message the voter received
+    // and show in the Slack thread the welcome message the voter received
     // in response.
     logger.debug(
       `ROUTER.introduceNewVoterToSlackChannel: Passing voter message to Slack, slackChannelName: ${slackChannelName}, parentMessageTs: ${response.data.ts}.`
     );
+    const blocks = SlackBlockUtil.formatMessageWithAttachmentLinks(
+      userMessage,
+      userAttachments
+    );
     await SlackApiUtil.sendMessage(
-      `*${userInfo.userId.substring(0, 5)}:* ${userMessage}`,
-      { parentMessageTs: response.data.ts, channel: response.data.channel },
+      '',
+      {
+        parentMessageTs: response.data.ts,
+        blocks,
+        channel: response.data.channel,
+        isVoterMessage: true,
+      },
       inboundDbMessageEntry,
       userInfo
     );
@@ -258,9 +342,10 @@ const introduceNewVoterToSlackChannel = async (
     logger.debug(
       `ROUTER.introduceNewVoterToSlackChannel: Passing automated welcome message to Slack, slackChannelName: ${slackChannelName}, parentMessageTs: ${response.data.channel}.`
     );
-    await SlackApiUtil.sendMessage(`*Automated Message:* ${messageToVoter}`, {
+    await SlackApiUtil.sendMessage(messageToVoter, {
       parentMessageTs: response.data.ts,
       channel: response.data.channel,
+      isAutomatedMessage: true,
     });
   }
 
@@ -293,7 +378,8 @@ export async function handleNewVoter(
   twilioPhoneNumber: string,
   inboundDbMessageEntry: DbApiUtil.DatabaseMessageEntry,
   entryPoint: EntryPoint,
-  twilioCallbackURL: string
+  twilioCallbackURL: string,
+  includeWelcome?: boolean
 ): Promise<void> {
   logger.debug('ENTERING ROUTER.handleNewVoter');
   const userMessage = userOptions.userMessage;
@@ -303,18 +389,12 @@ export async function handleNewVoter(
     entryPoint,
   });
 
-  await DbApiUtil.logVoterStatusToDb({
-    userId: userInfo.userId!,
-    userPhoneNumber: userOptions.userPhoneNumber,
+  await DbApiUtil.logInitialVoterStatusToDb(
+    userInfo.userId,
+    userOptions.userPhoneNumber,
     twilioPhoneNumber,
-    voterStatus: 'UNKNOWN',
-    originatingSlackUserName: null,
-    originatingSlackUserId: null,
-    slackChannelName: null,
-    slackChannelId: null,
-    slackParentMessageTs: null,
-    isDemo: userInfo.isDemo || null,
-  });
+    userInfo.isDemo
+  );
 
   let slackChannelName = userInfo.isDemo ? 'demo-lobby' : 'lobby';
   if (entryPoint === LoadBalancer.PULL_ENTRY_POINT) {
@@ -349,18 +429,24 @@ export async function handleNewVoter(
   }
 
   await introduceNewVoterToSlackChannel(
-    { userInfo: userInfo as UserInfo, userMessage },
+    {
+      userInfo: userInfo as UserInfo,
+      userMessage,
+      userAttachments: userOptions.userAttachments,
+    },
     redisClient,
     twilioPhoneNumber,
     inboundDbMessageEntry,
     entryPoint,
     slackChannelName,
-    twilioCallbackURL
+    twilioCallbackURL,
+    includeWelcome
   );
 }
 
 const postUserMessageHistoryToSlack = async (
   userId: string,
+  twilioPhoneNumber: string,
   timestampOfLastMessageInThread: string,
   messageHistoryContextText: string,
   {
@@ -374,6 +460,7 @@ const postUserMessageHistoryToSlack = async (
   logger.debug('ENTERING ROUTER.postUserMessageHistoryToSlack');
   const messageHistory = await DbApiUtil.getMessageHistoryFor(
     userId,
+    twilioPhoneNumber,
     timestampOfLastMessageInThread
   );
 
@@ -393,13 +480,20 @@ const postUserMessageHistoryToSlack = async (
     userId.substring(0, 5)
   );
 
-  await SlackApiUtil.sendMessage(
+  const msgInfo = await SlackApiUtil.sendMessage(
     `*Operator:* ${messageHistoryContextText}\n\n${formattedMessageHistory}`,
     {
       parentMessageTs: destinationSlackParentMessageTs,
       channel: destinationSlackChannelId,
     }
   );
+  if (msgInfo) {
+    await DbApiUtil.setThreadHistoryTs(
+      destinationSlackParentMessageTs,
+      destinationSlackChannelId,
+      msgInfo.data.ts
+    );
+  }
 };
 
 // This helper handles all tasks associated with routing a voter to a new
@@ -425,6 +519,24 @@ const routeVoterToSlackChannelHelper = async (
                 destinationSlackParentMessageTs: ${destinationSlackParentMessageTs},
                 destinationSlackChannelName: ${destinationSlackChannelName}`);
 
+  logger.debug(
+    "ROUTER.routeVoterToSlackChannelHelper: Changing voter's active channel."
+  );
+  // Reassign the active channel so that the next voter messages go to the
+  // new active channel.
+  userInfo.activeChannelId = destinationSlackChannelId;
+  userInfo.activeChannelName = destinationSlackChannelName;
+
+  // Update userInfo in Redis (remember state channel thread identifying info and new activeChannel).
+  logger.debug(
+    `ROUTER.routeVoterToSlackChannelHelper: Writing updated userInfo to Redis.`
+  );
+  await RedisApiUtil.setHash(
+    redisClient,
+    `${userInfo.userId}:${twilioPhoneNumber}`,
+    userInfo
+  );
+
   let messageHistoryContextText =
     'Below are our messages with the voter since they left this thread.';
   // If voter is new to a channel/thread, retrieve all message history. If a
@@ -443,28 +555,10 @@ const routeVoterToSlackChannelHelper = async (
     );
   }
 
-  logger.debug(
-    "ROUTER.routeVoterToSlackChannelHelper: Changing voter's active channel."
-  );
-  // Reassign the active channel so that the next voter messages go to the
-  // new active channel.
-  userInfo.activeChannelId = destinationSlackChannelId;
-  userInfo.activeChannelName = destinationSlackChannelName;
-
-  // Update userInfo in Redis (remember state channel thread identifying info and new activeChannel).
-  logger.debug(
-    `ROUTER.routeVoterToSlackChannelHelper: Writing updated userInfo to Redis.`
-  );
-
-  await RedisApiUtil.setHash(
-    redisClient,
-    `${userInfo.userId}:${twilioPhoneNumber}`,
-    userInfo
-  );
-
   // Populate state channel thread with message history so far.
   await postUserMessageHistoryToSlack(
     userInfo.userId,
+    twilioPhoneNumber,
     timestampOfLastMessageInThread,
     messageHistoryContextText,
     { destinationSlackParentMessageTs, destinationSlackChannelId }
@@ -487,6 +581,9 @@ const routeVoterToSlackChannel = async (
   },
   adminCommandParams?: AdminCommandParams /* only for admin re-routes (not automated)*/
 ) => {
+  const skipLobby =
+    (await RedisApiUtil.getKey(redisClient, 'skipLobby')) === 'true';
+
   logger.debug('ENTERING ROUTER.routeVoterToSlackChannel');
   const userPhoneNumber = userInfo.userPhoneNumber;
 
@@ -553,7 +650,7 @@ const routeVoterToSlackChannel = async (
       }
     );
     // Operations for AUTOMATED route of voter.
-  } else {
+  } else if (!skipLobby) {
     await SlackApiUtil.sendMessage(
       `*Operator:* Routing voter to *${destinationSlackChannelName}*.`,
       {
@@ -563,14 +660,31 @@ const routeVoterToSlackChannel = async (
     );
   }
 
-  // Remove the voter status panel from the old thread, in which the voter is no longer active.
-  // Note: First we need to fetch the old thread parent message blocks, for both 1. the
-  // text to be preserved when changing the parent message, and for 2. the other
-  // blocks to be transferred to the new thread.
-  const previousParentMessageBlocks = await SlackApiUtil.fetchSlackMessageBlocks(
-    userInfo.activeChannelId,
-    userInfo[userInfo.activeChannelId]
+  // The old thread no longer needs attention
+  const needsAttention = await DbApiUtil.getThreadNeedsAttentionFor(
+    userInfo[userInfo.activeChannelId],
+    userInfo.activeChannelId
   );
+  const oldSlackParentMessageTs = userInfo[userInfo.activeChannelId];
+  const oldChannelId = userInfo.activeChannelId;
+
+  let previousParentMessageBlocks;
+  if (userInfo.activeChannelId === 'NONEXISTENT_LOBBY') {
+    // In Slack, create entry channel message, followed by voter's message and intro text.
+    const operatorMessage = `*User ID:* ${userInfo.userId}\n*Connected via:* ${twilioPhoneNumber} (PULL)`;
+    previousParentMessageBlocks = SlackBlockUtil.getVoterStatusBlocks(
+      operatorMessage
+    );
+  } else {
+    // Remove the voter status panel from the old thread, in which the voter is no longer active.
+    // Note: First we need to fetch the old thread parent message blocks, for both 1. the
+    // text to be preserved when changing the parent message, and for 2. the other
+    // blocks to be transferred to the new thread.
+    previousParentMessageBlocks = await SlackApiUtil.fetchSlackMessageBlocks(
+      userInfo.activeChannelId,
+      userInfo[userInfo.activeChannelId]
+    );
+  }
 
   if (!previousParentMessageBlocks) {
     throw new Error('Unable to retrieve previousParentMessageBlocks');
@@ -578,7 +692,10 @@ const routeVoterToSlackChannel = async (
 
   // return SlackBlockUtil.populateDropdownWithLatestVoterStatus(previousParentMessageBlocks, userId).then(() => {
   // make deep copy of previousParentMessageBlocks
-  const closedVoterPanelMessage = `Voter has been routed to *${destinationSlackChannelName}*.`;
+  const closedVoterPanelMessage = `Voter has been routed to ${SlackApiUtil.linkToSlackChannel(
+    destinationSlackChannelId,
+    destinationSlackChannelName
+  )}.`;
   const closedVoterPanelBlocks = SlackBlockUtil.makeClosedVoterPanelBlocks(
     closedVoterPanelMessage,
     false /* include undo button */
@@ -590,11 +707,13 @@ const routeVoterToSlackChannel = async (
     closedVoterPanelBlocks
   );
 
-  await SlackInteractionApiUtil.replaceSlackMessageBlocks({
-    slackChannelId: userInfo.activeChannelId,
-    slackParentMessageTs: userInfo[userInfo.activeChannelId],
-    newBlocks: newPrevParentMessageBlocks,
-  });
+  if (userInfo.activeChannelId !== 'NONEXISTENT_LOBBY') {
+    await SlackInteractionApiUtil.replaceSlackMessageBlocks({
+      slackChannelId: userInfo.activeChannelId,
+      slackParentMessageTs: userInfo[userInfo.activeChannelId],
+      newBlocks: newPrevParentMessageBlocks,
+    });
+  }
 
   logger.debug(
     'ROUTER.routeVoterToSlackChannel: Successfully updated old thread parent message during channel move'
@@ -653,76 +772,95 @@ const routeVoterToSlackChannel = async (
       }
     );
 
-    return;
-  }
-  // If this user HAS been to the destination channel, use the same thread info.
-
-  if (!adminCommandParams) {
-    throw new Error('Missing adminCommandParams');
-  }
-
-  // Fetch the blocks of the parent message of the destination thread to which the voter is returning.
-  const destinationParentMessageBlocks = await SlackApiUtil.fetchSlackMessageBlocks(
-    destinationSlackChannelId,
-    userInfo[destinationSlackChannelId]
-  );
-
-  if (!destinationParentMessageBlocks) {
-    throw new Error('Unable to get destinationParentMessageBlocks');
-  }
-
-  // Preserve the voter info message of the destination thread to which the voter is returning, but otherwise use the blocks of the previous thread in which the voter was active.
-  if (previousParentMessageBlocks[0] && previousParentMessageBlocks[0].text) {
-    previousParentMessageBlocks[0].text.text =
-      destinationParentMessageBlocks[0].text.text;
+    // Create the thread with the origin thread's need_attention status
+    await DbApiUtil.logThreadToDb({
+      slackParentMessageTs: response.data.ts,
+      channelId: response.data.channel,
+      userId: userInfo.userId,
+      userPhoneNumber: userInfo.userPhoneNumber,
+      twilioPhoneNumber: twilioPhoneNumber,
+      needsAttention: needsAttention,
+      isDemo: userInfo.isDemo,
+    });
   } else {
-    logger.error(
-      'ROUTER.routeVoterToSlackChannel: ERROR replacing voter info text above voter panel blocks that are being moved.'
+    // If this user HAS been to the destination channel, use the same thread info.
+
+    if (!adminCommandParams) {
+      throw new Error('Missing adminCommandParams');
+    }
+
+    // Fetch the blocks of the parent message of the destination thread to which the voter is returning.
+    const destinationParentMessageBlocks = await SlackApiUtil.fetchSlackMessageBlocks(
+      destinationSlackChannelId,
+      userInfo[destinationSlackChannelId]
+    );
+
+    if (!destinationParentMessageBlocks) {
+      throw new Error('Unable to get destinationParentMessageBlocks');
+    }
+
+    // Preserve the voter info message of the destination thread to which the voter is returning, but otherwise use the blocks of the previous thread in which the voter was active.
+    if (previousParentMessageBlocks[0] && previousParentMessageBlocks[0].text) {
+      previousParentMessageBlocks[0].text.text =
+        destinationParentMessageBlocks[0].text.text;
+    } else {
+      logger.error(
+        'ROUTER.routeVoterToSlackChannel: ERROR replacing voter info text above voter panel blocks that are being moved.'
+      );
+    }
+
+    await SlackInteractionApiUtil.replaceSlackMessageBlocks({
+      slackChannelId: destinationSlackChannelId,
+      slackParentMessageTs: userInfo[destinationSlackChannelId],
+      newBlocks: previousParentMessageBlocks,
+    });
+
+    logger.debug(
+      `ROUTER.routeVoterToSlackChannel: Returning voter back to *${destinationSlackChannelName}* from *${adminCommandParams.previousSlackChannelName}*. Voter has been here before.`
+    );
+
+    await SlackApiUtil.sendMessage(
+      `*Operator:* Voter *${userId}* was routed from *${adminCommandParams.previousSlackChannelName}* back to this channel by *${adminCommandParams.routingSlackUserName}*. See their thread with *${twilioPhoneNumber}* above.`,
+      { channel: destinationSlackChannelId }
+    );
+
+    const timestampOfLastMessageInThread = await DbApiUtil.getTimestampOfLastMessageInThread(
+      userInfo[destinationSlackChannelId]
+    );
+
+    logger.debug(
+      `timestampOfLastMessageInThread: ${timestampOfLastMessageInThread}`
+    );
+
+    // Set destination thread to have same needs_attention status as origin thread
+    await DbApiUtil.reactivateThread(
+      userInfo[destinationSlackChannelId],
+      destinationSlackChannelId,
+      needsAttention
+    );
+
+    await SlackApiUtil.sendMessage(
+      `*Operator:* Voter *${userId}* was routed from *${adminCommandParams.previousSlackChannelName}* back to this thread by *${adminCommandParams.routingSlackUserName}*. Messages sent here will again relay to the voter.`,
+      {
+        channel: destinationSlackChannelId,
+        parentMessageTs: userInfo[destinationSlackChannelId],
+      }
+    );
+
+    await routeVoterToSlackChannelHelper(
+      userInfo,
+      redisClient,
+      twilioPhoneNumber,
+      {
+        destinationSlackChannelName,
+        destinationSlackChannelId,
+        destinationSlackParentMessageTs: userInfo[destinationSlackChannelId],
+      },
+      timestampOfLastMessageInThread
     );
   }
 
-  await SlackInteractionApiUtil.replaceSlackMessageBlocks({
-    slackChannelId: destinationSlackChannelId,
-    slackParentMessageTs: userInfo[destinationSlackChannelId],
-    newBlocks: previousParentMessageBlocks,
-  });
-
-  logger.debug(
-    `ROUTER.routeVoterToSlackChannel: Returning voter back to *${destinationSlackChannelName}* from *${adminCommandParams.previousSlackChannelName}*. Voter has been here before.`
-  );
-
-  await SlackApiUtil.sendMessage(
-    `*Operator:* Voter *${userId}* was routed from *${adminCommandParams.previousSlackChannelName}* back to this channel by *${adminCommandParams.routingSlackUserName}*. See their thread with *${twilioPhoneNumber}* above.`,
-    { channel: destinationSlackChannelId }
-  );
-
-  const timestampOfLastMessageInThread = await DbApiUtil.getTimestampOfLastMessageInThread(
-    userInfo[destinationSlackChannelId]
-  );
-
-  logger.debug(
-    `timestampOfLastMessageInThread: ${timestampOfLastMessageInThread}`
-  );
-
-  await SlackApiUtil.sendMessage(
-    `*Operator:* Voter *${userId}* was routed from *${adminCommandParams.previousSlackChannelName}* back to this thread by *${adminCommandParams.routingSlackUserName}*. Messages sent here will again relay to the voter.`,
-    {
-      channel: destinationSlackChannelId,
-      parentMessageTs: userInfo[destinationSlackChannelId],
-    }
-  );
-
-  await routeVoterToSlackChannelHelper(
-    userInfo,
-    redisClient,
-    twilioPhoneNumber,
-    {
-      destinationSlackChannelName,
-      destinationSlackChannelId,
-      destinationSlackParentMessageTs: userInfo[destinationSlackChannelId],
-    },
-    timestampOfLastMessageInThread
-  );
+  await DbApiUtil.setThreadInactive(oldSlackParentMessageTs, oldChannelId);
 };
 
 export async function determineVoterState(
@@ -745,18 +883,58 @@ export async function determineVoterState(
     `ROUTER.determineVoterState: Updating lastVoterMessageSecsFromEpoch to ${userInfo.lastVoterMessageSecsFromEpoch}`
   );
 
-  const lobbyChannelId = userInfo.activeChannelId;
-  const lobbyParentMessageTs = userInfo[lobbyChannelId];
+  const skipLobby =
+    (await RedisApiUtil.getKey(redisClient, 'skipLobby')) === 'true';
 
-  logger.debug(
-    `ROUTER.determineVoterState: Passing voter message to Slack, slackChannelName: ${lobbyChannelId}, parentMessageTs: ${lobbyParentMessageTs}.`
-  );
-  await SlackApiUtil.sendMessage(
-    `*${userId.substring(0, 5)}:* ${userMessage}`,
-    { parentMessageTs: lobbyParentMessageTs, channel: lobbyChannelId },
-    inboundDbMessageEntry,
-    userInfo
-  );
+  const lobbyChannelId = skipLobby ? '' : userInfo.activeChannelId;
+  const lobbyParentMessageTs = skipLobby ? '' : userInfo[lobbyChannelId];
+
+  if (!skipLobby) {
+    logger.debug(
+      `ROUTER.determineVoterState: Passing voter message to Slack, slackChannelName: ${lobbyChannelId}, parentMessageTs: ${lobbyParentMessageTs}.`
+    );
+    const blocks = SlackBlockUtil.formatMessageWithAttachmentLinks(
+      userMessage,
+      userOptions.userAttachments
+    );
+    await SlackApiUtil.sendMessage(
+      '',
+      {
+        parentMessageTs: lobbyParentMessageTs,
+        blocks,
+        channel: lobbyChannelId,
+        isVoterMessage: true,
+      },
+      inboundDbMessageEntry,
+      userInfo
+    );
+  } else {
+    if (inboundDbMessageEntry) {
+      logger.info(
+        `SLACKAPIUTIL.sendMessage: This Slack message send will log to DB (inboundDbMessageEntry is not null).`
+      );
+      // Copies a few fields from userInfo to inboundDbMessageEntry.
+      DbApiUtil.updateDbMessageEntryWithUserInfo(
+        userInfo!,
+        inboundDbMessageEntry
+      );
+      inboundDbMessageEntry.slackChannel = 'NONEXISTENT_LOBBY';
+      inboundDbMessageEntry.slackParentMessageTs = 'NONEXISTENT_LOBBY_TS';
+      inboundDbMessageEntry.slackSendTimestamp = new Date();
+    }
+    inboundDbMessageEntry.successfullySent = true;
+
+    try {
+      await DbApiUtil.logMessageToDb(inboundDbMessageEntry);
+      if (!skipLobby)
+        await DbApiUtil.updateThreadStatusFromMessage(inboundDbMessageEntry);
+    } catch (error) {
+      logger.info(
+        `SLACKAPIUTIL.sendMessage: failed to log message send success to DB`
+      );
+      Sentry.captureException(error);
+    }
+  }
 
   let stateName = StateParser.determineState(userMessage);
 
@@ -776,13 +954,13 @@ export async function determineVoterState(
         { userPhoneNumber, twilioPhoneNumber, twilioCallbackURL },
         DbApiUtil.populateAutomatedDbMessageEntry(userInfo)
       );
-      await SlackApiUtil.sendMessage(
-        `*Automated Message:* ${MessageConstants.CLARIFY_STATE()}`,
-        {
+      if (!skipLobby) {
+        await SlackApiUtil.sendMessage(MessageConstants.CLARIFY_STATE(), {
           parentMessageTs: lobbyParentMessageTs,
           channel: lobbyChannelId,
-        }
-      );
+          isAutomatedMessage: true,
+        });
+      }
 
       logger.debug(
         `ROUTER.determineVoterState: Writing updated userInfo to Redis.`
@@ -797,7 +975,7 @@ export async function determineVoterState(
     }
   }
 
-  // This is used for display as well as to know later that the voter's
+  // This is used for display, DB logging, as well as to know later that the voter's
   // U.S. state has been determined.
   userInfo.stateName = stateName;
   logger.debug(
@@ -814,10 +992,13 @@ export async function determineVoterState(
     { userPhoneNumber, twilioPhoneNumber, twilioCallbackURL },
     DbApiUtil.populateAutomatedDbMessageEntry(userInfo)
   );
-  await SlackApiUtil.sendMessage(`*Automated Message:* ${messageToVoter}`, {
-    parentMessageTs: lobbyParentMessageTs,
-    channel: lobbyChannelId,
-  });
+  if (!skipLobby) {
+    await SlackApiUtil.sendMessage(messageToVoter, {
+      parentMessageTs: lobbyParentMessageTs,
+      channel: lobbyChannelId,
+      isAutomatedMessage: true,
+    });
+  }
 
   let selectedStateChannelName = await LoadBalancer.selectSlackChannel(
     redisClient,
@@ -857,8 +1038,27 @@ export async function clarifyHelplineRequest(
   const userInfo = userOptions.userInfo;
   userInfo.lastVoterMessageSecsFromEpoch = Math.round(Date.now() / 1000);
 
+  let messageToVoter = MessageConstants.CLARIFY_HELPLINE_REQUEST();
+
+  if (isVotedKeyword(userOptions.userMessage)) {
+    messageToVoter = MessageConstants.VOTED_WELCOME_RESPONSE();
+    await DbApiUtil.logVoterStatusToDb({
+      userId: userInfo.userId,
+      userPhoneNumber: userInfo.userPhoneNumber,
+      twilioPhoneNumber: twilioPhoneNumber,
+      isDemo: userInfo.isDemo,
+      voterStatus: 'VOTED',
+      originatingSlackUserName: null,
+      originatingSlackUserId: null,
+      slackChannelName: null,
+      slackChannelId: null,
+      slackParentMessageTs: null,
+      actionTs: null,
+    });
+  }
+
   await TwilioApiUtil.sendMessage(
-    MessageConstants.CLARIFY_HELPLINE_REQUEST(),
+    messageToVoter,
     {
       userPhoneNumber: userOptions.userPhoneNumber,
       twilioPhoneNumber,
@@ -912,9 +1112,13 @@ export async function handleDisclaimer(
   );
   userInfo.lastVoterMessageSecsFromEpoch = Math.round(Date.now() / 1000);
 
+  const blocks = SlackBlockUtil.formatMessageWithAttachmentLinks(
+    userMessage,
+    userOptions.userAttachments
+  );
   await SlackApiUtil.sendMessage(
-    `*${userId.substring(0, 5)}:* ${userMessage}`,
-    slackLobbyMessageParams,
+    '',
+    { ...slackLobbyMessageParams, blocks, isVoterMessage: true },
     inboundDbMessageEntry,
     userInfo
   );
@@ -952,10 +1156,10 @@ export async function handleDisclaimer(
     },
     DbApiUtil.populateAutomatedDbMessageEntry(userInfo)
   );
-  await SlackApiUtil.sendMessage(
-    `*Automated Message:* ${automatedMessage}`,
-    slackLobbyMessageParams
-  );
+  await SlackApiUtil.sendMessage(automatedMessage, {
+    ...slackLobbyMessageParams,
+    isAutomatedMessage: true,
+  });
 }
 
 export async function handleClearedVoter(
@@ -979,9 +1183,18 @@ export async function handleClearedVoter(
   // Update the lastVoterMessageSecsFromEpoch, for use in DB write below.
   userInfo.lastVoterMessageSecsFromEpoch = nowSecondsEpoch;
 
+  const blocks = SlackBlockUtil.formatMessageWithAttachmentLinks(
+    userOptions.userMessage,
+    userOptions.userAttachments
+  );
+
   await SlackApiUtil.sendMessage(
-    `*${userId.substring(0, 5)}:* ${userOptions.userMessage}`,
-    activeChannelMessageParams,
+    '',
+    {
+      ...activeChannelMessageParams,
+      blocks,
+      isVoterMessage: true,
+    },
     inboundDbMessageEntry,
     userInfo
   );
@@ -1001,9 +1214,14 @@ export async function handleClearedVoter(
         nowSecondsEpoch - lastVoterMessageSecsFromEpoch
       } > : ${MINS_BEFORE_WELCOME_BACK_MESSAGE}), sending welcome back message.`
     );
-    const welcomeBackMessage = MessageConstants.WELCOME_BACK();
+    let userMessage = null as string | null;
+    if (isVotedKeyword(userOptions.userMessage)) {
+      userMessage = MessageConstants.VOTED_RESPONSE();
+    } else {
+      userMessage = MessageConstants.WELCOME_BACK();
+    }
     await TwilioApiUtil.sendMessage(
-      welcomeBackMessage,
+      userMessage,
       {
         userPhoneNumber: userOptions.userPhoneNumber,
         twilioPhoneNumber,
@@ -1011,10 +1229,10 @@ export async function handleClearedVoter(
       },
       DbApiUtil.populateAutomatedDbMessageEntry(userInfo)
     );
-    await SlackApiUtil.sendMessage(
-      `*Automated Message:* ${welcomeBackMessage}`,
-      activeChannelMessageParams
-    );
+    await SlackApiUtil.sendMessage(userMessage, {
+      ...activeChannelMessageParams,
+      isAutomatedMessage: true,
+    });
   }
 
   logger.debug(`ROUTER.handleClearedVoter: Writing updated userInfo to Redis.`);
@@ -1076,6 +1294,31 @@ export async function handleSlackVoterThreadMessage(
     slackRetryNum: retryCount,
     slackRetryReason: retryReason,
   });
+  outboundDbMessageEntry.slackFiles = reqBody.event.files;
+
+  // check attachments
+  if (reqBody.event.files) {
+    let errors = MessageParser.validateSlackAttachments(reqBody.event.files);
+    if (!errors.length) {
+      errors = await SlackApiUtil.makeFilesPublic(reqBody.event.files);
+    }
+    if (errors.length) {
+      await SlackApiUtil.sendMessage(
+        'Sorry, there was a problem with one or more of your attachments:\n' +
+          errors.map((x) => `>${x}`).join('\n'),
+        {
+          channel: reqBody.event.channel,
+          parentMessageTs: reqBody.event.thread_ts,
+        }
+      );
+      await SlackApiUtil.addSlackMessageReaction(
+        reqBody.event.channel,
+        reqBody.event.ts,
+        'x'
+      );
+      return;
+    }
+  }
 
   const userInfo = (await RedisApiUtil.getHash(
     redisClient,
@@ -1129,6 +1372,7 @@ export type SlackEventRequestBody = {
     thread_ts: string;
     user: string;
     channel: string;
+    files?: SlackFile[];
   };
   authed_users: string[];
 };

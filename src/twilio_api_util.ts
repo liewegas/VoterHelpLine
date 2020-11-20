@@ -3,6 +3,7 @@ import * as DbApiUtil from './db_api_util';
 import logger from './logger';
 import twilio from 'twilio';
 import isFirstUseOfKey from './deduplication';
+import * as MessageParser from './message_parser';
 
 const twilioClient = twilio(
   process.env.TWILIO_ACCOUNT_SID,
@@ -41,6 +42,9 @@ export async function sendMessage(
 
     try {
       await DbApiUtil.logMessageToDb(databaseMessageEntry);
+      if (databaseMessageEntry.slackParentMessageTs) {
+        await DbApiUtil.updateThreadStatusFromMessage(databaseMessageEntry);
+      }
     } catch (error) {
       logger.error(
         'TWILIOAPIUTIL.sendMessage: failed to log message send duplication failure to DB'
@@ -52,11 +56,23 @@ export async function sendMessage(
   }
 
   try {
+    let media = [] as string[];
+    if (databaseMessageEntry.slackFiles) {
+      media = MessageParser.getSlackAttachments(
+        databaseMessageEntry.slackFiles
+      );
+      logger.info(
+        `TWILIOAPIUTIL.sendMessage: Including attachments ${JSON.stringify(
+          media
+        )}`
+      );
+    }
     const response = await twilioClient.messages.create({
       body: message,
       from: options.twilioPhoneNumber,
       to: options.userPhoneNumber,
       statusCallback: options.twilioCallbackURL,
+      mediaUrl: media,
     });
 
     logger.info(`TWILIOAPIUTIL.sendMessage: Successfully sent Twilio message,
@@ -70,6 +86,9 @@ export async function sendMessage(
 
     try {
       await DbApiUtil.logMessageToDb(databaseMessageEntry);
+      if (databaseMessageEntry.slackParentMessageTs) {
+        await DbApiUtil.updateThreadStatusFromMessage(databaseMessageEntry);
+      }
     } catch (error) {
       logger.error(
         'TWILIOAPIUTIL.sendMessage: failed to log message send success to DB'
@@ -98,6 +117,9 @@ export async function sendMessage(
 
     try {
       await DbApiUtil.logMessageToDb(databaseMessageEntry);
+      if (databaseMessageEntry.slackParentMessageTs) {
+        await DbApiUtil.updateThreadStatusFromMessage(databaseMessageEntry);
+      }
     } catch (error) {
       logger.error(
         'TWILIOAPIUTIL.sendMessage: failed to log message send failure to DB'

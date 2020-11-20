@@ -7,10 +7,12 @@ import {
   HistoricalMessage,
   SlackThreadInfo,
 } from './types';
+
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   max: Number(process.env.CONNECTION_POOL_MAX || 20),
 });
+import { SlackFile } from './message_parser';
 
 export type DatabaseMessageEntry = {
   message?: string | null;
@@ -40,6 +42,9 @@ export type DatabaseMessageEntry = {
   originatingSlackUserName?: string | null;
   entryPoint: EntryPoint | null;
   archived?: boolean | null;
+  stateName?: string | null;
+  slackFiles?: SlackFile[] | null;
+  twilioAttachments?: string[] | null;
 };
 
 export type DatabaseVoterStatusEntry = {
@@ -86,13 +91,46 @@ export type DatabaseCommandEntry = {
   failureReason?: string | null;
 };
 
+export type DatabaseThreadEntry = {
+  slackParentMessageTs: string;
+  channelId: string;
+  userId: string;
+  userPhoneNumber: string;
+  twilioPhoneNumber: string;
+  needsAttention: boolean;
+  isDemo: boolean;
+};
+
+export type ThreadInfo = {
+  slackParentMessageTs: string;
+  channelId: string;
+  userId: string | null;
+  lastUpdateAge: number | null;
+  volunteerSlackUserId: string | null;
+  volunteerSlackUserName: string | null;
+  voterStatus?: string;
+};
+
+export type ChannelStat = {
+  channelId: string;
+  count: number;
+  maxLastUpdateAge: number;
+};
+
+export type VolunteerStat = {
+  volunteerSlackUserId: string;
+  volunteerSlackUserName: string;
+  count: number;
+  maxLastUpdateAge: number;
+};
+
 export async function logMessageToDb(
   databaseMessageEntry: DatabaseMessageEntry
 ): Promise<void> {
   const client = await pool.connect();
   try {
     await client.query(
-      'INSERT INTO messages (message, direction, automated, successfully_sent, from_phone_number, user_id, to_phone_number, originating_slack_user_id, slack_channel, slack_parent_message_ts, twilio_message_sid, slack_message_ts, slack_error, twilio_error, twilio_send_timestamp, twilio_receive_timestamp, slack_send_timestamp, slack_receive_timestamp, confirmed_disclaimer, is_demo, last_voter_message_secs_from_epoch, unprocessed_message, slack_retry_num, slack_retry_reason, originating_slack_user_name, entry_point, archived) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27);',
+      'INSERT INTO messages (message, direction, automated, successfully_sent, from_phone_number, user_id, to_phone_number, originating_slack_user_id, slack_channel, slack_parent_message_ts, twilio_message_sid, slack_message_ts, slack_error, twilio_error, twilio_send_timestamp, twilio_receive_timestamp, slack_send_timestamp, slack_receive_timestamp, confirmed_disclaimer, is_demo, last_voter_message_secs_from_epoch, unprocessed_message, slack_retry_num, slack_retry_reason, originating_slack_user_name, entry_point, archived, state_name, slack_attachments, twilio_attachments) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30);',
       [
         databaseMessageEntry.message,
         databaseMessageEntry.direction,
@@ -121,9 +159,18 @@ export async function logMessageToDb(
         databaseMessageEntry.originatingSlackUserName,
         databaseMessageEntry.entryPoint,
         databaseMessageEntry.archived,
+        databaseMessageEntry.stateName,
+
+        // We can't just pass these arrays as-is because these are JSON columns,
+        // and node-pg serializes arrays as PG arrays rather than JSON arrays.
+        databaseMessageEntry.slackFiles
+          ? JSON.stringify(databaseMessageEntry.slackFiles)
+          : null,
+        databaseMessageEntry.twilioAttachments
+          ? JSON.stringify(databaseMessageEntry.twilioAttachments)
+          : null,
       ]
     );
-
     logger.info(
       `DBAPIUTIL.logMessageToDb: Successfully inserted message into PostgreSQL database.`
     );
@@ -140,12 +187,14 @@ export function populateIncomingDbMessageTwilioEntry({
   userPhoneNumber,
   twilioPhoneNumber,
   twilioMessageSid,
+  twilioAttachments,
   entryPoint,
 }: {
   userMessage: string;
   userPhoneNumber: string;
   twilioPhoneNumber: string;
   twilioMessageSid: string;
+  twilioAttachments: string[];
   entryPoint: EntryPoint;
 }): DatabaseMessageEntry {
   return {
@@ -175,6 +224,9 @@ export function populateIncomingDbMessageTwilioEntry({
     slackError: null,
     twilioError: null,
 
+    // Array of attached media to MMS
+    twilioAttachments,
+
     twilioSendTimestamp: null,
     twilioReceiveTimestamp: new Date(),
     // To be filled later
@@ -197,6 +249,9 @@ export function populateIncomingDbMessageTwilioEntry({
     lastVoterMessageSecsFromEpoch: null,
 
     archived: false,
+
+    // To be filled later
+    stateName: null,
   };
 }
 
@@ -264,6 +319,9 @@ export function populateIncomingDbMessageSlackEntry({
     lastVoterMessageSecsFromEpoch: null,
 
     archived: false,
+
+    // To be filled later
+    stateName: null,
   };
 }
 
@@ -278,6 +336,7 @@ export function updateDbMessageEntryWithUserInfo(
   dbMessageEntry.lastVoterMessageSecsFromEpoch =
     userInfo.lastVoterMessageSecsFromEpoch;
   dbMessageEntry.entryPoint = userInfo.entryPoint;
+  dbMessageEntry.stateName = userInfo.stateName;
 }
 
 // Populates a DB entry with available info right before it is passed to TwilioApiUtil for additional info and writing to DB.
@@ -330,6 +389,8 @@ export function populateAutomatedDbMessageEntry(
     lastVoterMessageSecsFromEpoch: userInfo.lastVoterMessageSecsFromEpoch,
 
     archived: false,
+
+    stateName: userInfo.stateName,
   };
 }
 
@@ -347,32 +408,37 @@ const MESSAGE_HISTORY_SQL_SCRIPT = `
     message,
     automated,
     direction,
-    originating_slack_user_name
+    originating_slack_user_name,
+    slack_attachments,
+    twilio_attachments
   FROM messages
   WHERE user_id = $1
     AND NOT archived
+    AND (to_phone_number = $2 OR from_phone_number = $2)
     AND (
       CASE
       WHEN twilio_receive_timestamp IS NOT NULL THEN twilio_receive_timestamp
       WHEN slack_receive_timestamp IS NOT NULL THEN slack_receive_timestamp
       ELSE twilio_send_timestamp
       END
-    ) > $2
+    ) > $3
   ORDER BY timestamp ASC;`;
 
 export async function getMessageHistoryFor(
   userId: string,
+  twilioPhoneNumber: string,
   timestampSince: string
 ): Promise<HistoricalMessage[]> {
   logger.info(`ENTERING DBAPIUTIL.getMessageHistoryFor`);
   logger.info(
-    `DBAPIUTIL.getMessageHistoryFor: Looking up user:${userId}, message history since timestamp: ${timestampSince}.`
+    `DBAPIUTIL.getMessageHistoryFor: Looking up user:${userId}, ${twilioPhoneNumber}, message history since timestamp: ${timestampSince}.`
   );
 
   const client = await pool.connect();
   try {
     const result = await client.query(MESSAGE_HISTORY_SQL_SCRIPT, [
       userId,
+      twilioPhoneNumber,
       timestampSince,
     ]);
     logger.info(
@@ -439,8 +505,8 @@ export async function getSlackThreadsForVoter(
   try {
     const result = await client.query(
       `SELECT slack_channel, slack_parent_message_ts
-        FROM messages 
-        WHERE user_id = $1 
+        FROM messages
+        WHERE user_id = $1
           AND (to_phone_number = $2 OR from_phone_number = $2)
           AND slack_parent_message_ts IS NOT NULL
           AND NOT archived
@@ -466,11 +532,11 @@ export async function getSlackThreadsForVoter(
   }
 }
 
-export async function archiveMessagesForDemoVoter(
+export async function archiveDemoVoter(
   userId: string,
   twilioPhoneNumber: string
 ): Promise<void> {
-  logger.info(`ENTERING DBAPIUTIL.getSlackThreadsForVoter`);
+  logger.info(`ENTERING DBAPIUTIL.archiveDemoVoter`);
 
   const client = await pool.connect();
 
@@ -482,15 +548,568 @@ export async function archiveMessagesForDemoVoter(
         AND (to_phone_number = $2 OR from_phone_number = $2);`,
       [userId, twilioPhoneNumber]
     );
-
+    await client.query(
+      `UPDATE voter_status_updates
+      SET archived = true
+      WHERE
+        is_demo = true
+        AND user_id = $1
+        AND twilio_phone_number = $2`,
+      [userId, twilioPhoneNumber]
+    );
+    await client.query(
+      `UPDATE volunteer_voter_claims
+      SET archived = true
+      WHERE
+        is_demo = true
+        AND user_id = $1
+        AND twilio_phone_number = $2`,
+      [userId, twilioPhoneNumber]
+    );
+    await client.query(
+      `UPDATE threads
+      SET archived = true
+      WHERE
+        is_demo = true
+        AND user_id = $1
+        AND twilio_phone_number = $2`,
+      [userId, twilioPhoneNumber]
+    );
     logger.info(
-      `DBAPIUTIL.getSlackThreadsForVoter: Successfully fetched Slack threads for voter.`
+      `DBAPIUTIL.archiveDemoVoter: Successfully archived demo voter.`
     );
   } finally {
     client.release();
   }
 }
 
+export async function logThreadToDb(
+  databaseThreadEntry: DatabaseThreadEntry
+): Promise<void> {
+  const client = await pool.connect();
+  try {
+    await client.query(
+      'INSERT INTO threads (slack_parent_message_ts, slack_channel_id, user_id, user_phone_number, twilio_phone_number, needs_attention, is_demo, updated_at, active) VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), true)',
+      [
+        databaseThreadEntry.slackParentMessageTs,
+        databaseThreadEntry.channelId,
+        databaseThreadEntry.userId,
+        databaseThreadEntry.userPhoneNumber,
+        databaseThreadEntry.twilioPhoneNumber,
+        databaseThreadEntry.needsAttention,
+        databaseThreadEntry.isDemo,
+      ]
+    );
+    logger.info('DBAPIUTIL.logThreadToDb: Successfully created thread');
+  } finally {
+    client.release();
+  }
+}
+
+export async function updateThreadStatusFromMessage(
+  databaseMessageEntry: DatabaseMessageEntry
+): Promise<void> {
+  const client = await pool.connect();
+  try {
+    // Update thread status
+    let result;
+    if (databaseMessageEntry.direction === 'INBOUND') {
+      result = await client.query(
+        `UPDATE threads
+        SET needs_attention = true, updated_at=NOW()
+        WHERE slack_parent_message_ts = $1 AND slack_channel_id = $2`,
+        [
+          databaseMessageEntry.slackParentMessageTs,
+          databaseMessageEntry.slackChannel,
+        ]
+      );
+    } else if (
+      !databaseMessageEntry.automated &&
+      databaseMessageEntry.userId &&
+      databaseMessageEntry.toPhoneNumber &&
+      (await getVoterHasVolunteer(databaseMessageEntry.userId))
+    ) {
+      result = await client.query(
+        `UPDATE threads
+        SET needs_attention = false, updated_at=NOW()
+        WHERE slack_parent_message_ts = $1 AND slack_channel_id = $2`,
+        [
+          databaseMessageEntry.slackParentMessageTs,
+          databaseMessageEntry.slackChannel,
+        ]
+      );
+    } else {
+      result = await client.query(
+        `UPDATE threads
+        SET updated_at=NOW()
+        WHERE slack_parent_message_ts = $1 AND slack_channel_id = $2`,
+        [
+          databaseMessageEntry.slackParentMessageTs,
+          databaseMessageEntry.slackChannel,
+        ]
+      );
+    }
+    if (result.rowCount == 0) {
+      // If the thread doesn't already exist (because this thread predates the creation
+      // of the threads table), create it now.
+      await logThreadToDb({
+        slackParentMessageTs: databaseMessageEntry.slackParentMessageTs,
+        channelId: databaseMessageEntry.slackChannel,
+        userId: databaseMessageEntry.userId,
+        userPhoneNumber:
+          databaseMessageEntry.direction === 'INBOUND'
+            ? databaseMessageEntry.fromPhoneNumber
+            : databaseMessageEntry.toPhoneNumber,
+        twilioPhoneNumber:
+          databaseMessageEntry.direction === 'INBOUND'
+            ? databaseMessageEntry.toPhoneNumber
+            : databaseMessageEntry.fromPhoneNumber,
+        needsAttention: databaseMessageEntry.direction === 'INBOUND',
+      } as DatabaseThreadEntry);
+    }
+  } finally {
+    // Make sure to release the client before any error handling,
+    // just in case the error handling itself throws an error.
+    client.release();
+  }
+}
+
+export async function setThreadNeedsAttentionToDb(
+  slackParentMessageTs: string,
+  slackChannelId: string,
+  needsAttention: boolean
+): Promise<void> {
+  const client = await pool.connect();
+  try {
+    await client.query(
+      'UPDATE threads SET needs_attention = $1 WHERE slack_parent_message_ts = $2 AND slack_channel_id = $3;',
+      [needsAttention, slackParentMessageTs, slackChannelId]
+    );
+    logger.info(
+      `DBAPIUTIL.setThreadNeedsAttentionToDb: Set thread ${slackParentMessageTs} needs_attention=${needsAttention}`
+    );
+  } finally {
+    client.release();
+  }
+}
+
+export async function reactivateThread(
+  slackParentMessageTs: string,
+  slackChannelId: string,
+  needsAttention: boolean
+): Promise<void> {
+  const client = await pool.connect();
+  try {
+    await client.query(
+      'UPDATE threads SET needs_attention = $1, active = true WHERE slack_parent_message_ts = $2 AND slack_channel_id = $3;',
+      [needsAttention, slackParentMessageTs, slackChannelId]
+    );
+    logger.info(
+      `DBAPIUTIL.reactivateThread: Set thread ${slackParentMessageTs} needs_attention=${needsAttention}`
+    );
+  } finally {
+    client.release();
+  }
+}
+
+export async function setThreadInactive(
+  slackParentMessageTs: string,
+  slackChannelId: string
+): Promise<void> {
+  const client = await pool.connect();
+  try {
+    await client.query(
+      'UPDATE threads SET needs_attention = false, active = false WHERE slack_parent_message_ts = $1 AND slack_channel_id = $2;',
+      [slackParentMessageTs, slackChannelId]
+    );
+    logger.info(
+      `DBAPIUTIL.setThreadInactive: Set thread ${slackParentMessageTs} active=false, need_attention=false`
+    );
+  } finally {
+    client.release();
+  }
+}
+
+export async function setThreadHistoryTs(
+  slackParentMessageTs: string,
+  slackChannelId: string,
+  historyTs: string
+): Promise<void> {
+  const client = await pool.connect();
+  try {
+    await client.query(
+      'UPDATE threads SET history_ts = $1 WHERE slack_parent_message_ts = $2 AND slack_channel_id = $3;',
+      [historyTs, slackParentMessageTs, slackChannelId]
+    );
+  } finally {
+    client.release();
+  }
+}
+
+export async function getThreadLatestMessageTs(
+  slackParentMessageTs: string,
+  slackChannelId: string
+): Promise<string | null> {
+  const client = await pool.connect();
+  try {
+    const result = await client.query(
+      `SELECT
+        t.history_ts
+        , m.slack_message_ts
+      FROM threads t
+      LEFT JOIN messages m ON (
+        t.slack_parent_message_ts=m.slack_parent_message_ts
+        AND t.slack_channel_id=m.slack_channel
+        AND m.slack_message_ts IS NOT NULL
+      )
+      WHERE
+        t.slack_parent_message_ts=$1
+        AND t.slack_channel_id=$2
+      ORDER BY COALESCE(m.slack_send_timestamp, m.slack_receive_timestamp) DESC
+      LIMIT 1`,
+      [slackParentMessageTs, slackChannelId]
+    );
+    if (result.rows.length > 0) {
+      return result.rows[0]['slack_message_ts'] || result.rows[0]['history_ts'];
+    }
+    return null;
+  } finally {
+    client.release();
+  }
+}
+
+export async function getUnclaimedVoters(
+  channelId: string
+): Promise<ThreadInfo[]> {
+  const client = await pool.connect();
+  try {
+    const result = await client.query(
+      `WITH all_status AS (
+        SELECT
+          user_id, voter_status
+          , row_number() OVER (PARTITION BY user_id ORDER BY created_at DESC) AS rn
+        FROM voter_status_updates
+        WHERE archived IS NOT TRUE
+      ), latest_status AS (
+        SELECT user_id, voter_status FROM all_status WHERE rn=1
+      )
+      SELECT
+        t.slack_parent_message_ts
+        , t.slack_channel_id
+        , t.user_id
+        , EXTRACT(EPOCH FROM now() - t.updated_at) as last_update_age
+      FROM threads t
+      LEFT JOIN latest_status s ON (t.user_id = s.user_id)
+      WHERE
+        t.needs_attention
+        AND t.slack_channel_id = $1
+        AND NOT EXISTS (
+          SELECT FROM volunteer_voter_claims c
+          WHERE t.user_id=c.user_id
+          AND c.archived IS NOT TRUE
+        )
+        AND s.voter_status NOT IN ('REFUSED', 'SPAM')
+      ORDER BY t.updated_at`,
+      [channelId]
+    );
+    return result.rows.map((x) => ({
+      slackParentMessageTs: x['slack_parent_message_ts'],
+      channelId: x['slack_channel_id'],
+      userId: x['user_id'],
+      lastUpdateAge: x['last_update_age'],
+      volunteerSlackUserId: null,
+      volunteerSlackUserName: null,
+    }));
+  } finally {
+    client.release();
+  }
+}
+
+// Return a list of ChannelStat's for all unclaimed voters
+export async function getUnclaimedVotersByChannel(): Promise<ChannelStat[]> {
+  const client = await pool.connect();
+  try {
+    const result = await client.query(
+      `WITH all_status AS (
+        SELECT
+          user_id, voter_status
+          , row_number() OVER (PARTITION BY user_id ORDER BY created_at DESC) AS rn
+        FROM voter_status_updates
+        WHERE archived IS NOT TRUE
+      ), latest_status AS (
+        SELECT user_id, voter_status FROM all_status WHERE rn=1
+      )
+      SELECT
+        count(*)
+        , slack_channel_id
+        , MAX(EXTRACT(EPOCH FROM now() - updated_at)) as max_last_update_age
+      FROM threads t
+      LEFT JOIN latest_status s ON (t.user_id = s.user_id)
+      WHERE
+        needs_attention
+        AND s.voter_status NOT IN ('REFUSED', 'SPAM')
+        AND NOT EXISTS (
+          SELECT FROM volunteer_voter_claims c
+          WHERE t.user_id=c.user_id
+          AND c.archived IS NOT TRUE
+        )
+      GROUP BY slack_channel_id
+      ORDER BY max_last_update_age DESC`
+    );
+    return result.rows.map(
+      (x) =>
+        ({
+          channelId: x['slack_channel_id'],
+          count: x['count'],
+          maxLastUpdateAge: x['max_last_update_age'],
+        } as ChannelStat)
+    );
+  } finally {
+    client.release();
+  }
+}
+
+// Return a list of ChannelStat's for all threads needing attention
+export async function getThreadsNeedingAttentionByChannel(): Promise<
+  ChannelStat[]
+> {
+  const client = await pool.connect();
+  try {
+    const result = await client.query(
+      `SELECT
+        count(*)
+        , slack_channel_id
+        , MAX(EXTRACT(EPOCH FROM now() - updated_at)) as max_last_update_age
+        FROM threads t
+        WHERE
+          needs_attention
+        GROUP BY slack_channel_id
+        ORDER BY max_last_update_age DESC`
+    );
+    return result.rows.map(
+      (x) =>
+        ({
+          channelId: x['slack_channel_id'],
+          count: x['count'],
+          maxLastUpdateAge: x['max_last_update_age'],
+        } as ChannelStat)
+    );
+  } finally {
+    client.release();
+  }
+}
+
+// Return a list of VolunteerStat's for all threads needing attention
+export async function getThreadsNeedingAttentionByVolunteer(): Promise<
+  VolunteerStat[]
+> {
+  const client = await pool.connect();
+  try {
+    const result = await client.query(
+      `WITH claims AS (
+        SELECT
+          user_id
+          , volunteer_slack_user_id
+          , volunteer_slack_user_name
+          , row_number () OVER (PARTITION BY user_id ORDER BY created_at DESC) AS rn
+        FROM volunteer_voter_claims
+        WHERE archived IS NOT TRUE
+      )
+      SELECT
+        count(*)
+        , volunteer_slack_user_id
+        , volunteer_slack_user_name
+        , MAX(EXTRACT(EPOCH FROM now() - updated_at)) as max_last_update_age
+        FROM threads t, claims c
+        WHERE
+          needs_attention
+          AND t.user_id=c.user_id
+          AND c.rn=1
+        GROUP BY volunteer_slack_user_id, volunteer_slack_user_name
+        ORDER BY max_last_update_age DESC`
+    );
+    return result.rows.map(
+      (x) =>
+        ({
+          volunteerSlackUserId: x['volunteer_slack_user_id'],
+          volunteerSlackUserName: x['volunteer_slack_user_name'],
+          count: x['count'],
+          maxLastUpdateAge: x['max_last_update_age'],
+        } as VolunteerStat)
+    );
+  } finally {
+    client.release();
+  }
+}
+
+// Return a list of ThreadInfo's for all threads needing attention in a channel
+export async function getThreadsNeedingAttentionForChannel(
+  channelId: string
+): Promise<ThreadInfo[]> {
+  const client = await pool.connect();
+  try {
+    const result = await client.query(
+      `WITH claims AS (
+        SELECT
+          user_id
+          , volunteer_slack_user_id
+          , volunteer_slack_user_name
+          , row_number () OVER (PARTITION BY user_id ORDER BY created_at DESC) AS rn
+        FROM volunteer_voter_claims
+        WHERE archived IS NOT TRUE
+      )
+      SELECT
+        slack_parent_message_ts
+        , slack_channel_id
+        , t.user_id
+        , EXTRACT(EPOCH FROM now() - updated_at) as last_update_age
+        , c.volunteer_slack_user_id
+        , c.volunteer_slack_user_name
+        FROM threads t, claims c
+        WHERE
+          needs_attention
+          AND t.user_id=c.user_id
+          AND c.rn=1
+          AND slack_channel_id = $1
+        ORDER BY updated_at`,
+      [channelId]
+    );
+    return result.rows.map((x) => ({
+      slackParentMessageTs: x['slack_parent_message_ts'],
+      channelId: x['slack_channel_id'],
+      userId: x['user_id'],
+      lastUpdateAge: x['last_update_age'],
+      volunteerSlackUserId: x['volunteer_slack_user_id'],
+      volunteerSlackUserName: x['volunteer_slack_user_name'],
+    }));
+  } finally {
+    client.release();
+  }
+}
+
+// Return a list of ThreadInfo's for all threads needing attention for a slack user
+export async function getThreadsNeedingAttentionFor(
+  slackUserId: string
+): Promise<ThreadInfo[]> {
+  const client = await pool.connect();
+  try {
+    const result = await client.query(
+      `WITH claims AS (
+        SELECT
+          user_id
+          , volunteer_slack_user_id
+          , volunteer_slack_user_name
+          , row_number () OVER (PARTITION BY user_id ORDER BY created_at DESC) AS rn
+        FROM volunteer_voter_claims
+        WHERE archived IS NOT TRUE
+      )
+      SELECT
+        slack_parent_message_ts
+        , slack_channel_id
+        , t.user_id
+        , EXTRACT(EPOCH FROM now() - updated_at) as last_update_age
+        , c.volunteer_slack_user_name
+        FROM threads t, claims c
+        WHERE
+          needs_attention
+          AND t.user_id=c.user_id
+          AND c.rn=1
+          AND c.volunteer_slack_user_id=$1
+        ORDER BY updated_at`,
+      [slackUserId]
+    );
+    return result.rows.map((x) => ({
+      slackParentMessageTs: x['slack_parent_message_ts'],
+      channelId: x['slack_channel_id'],
+      userId: x['user_id'],
+      lastUpdateAge: x['last_update_age'],
+      volunteerSlackUserId: slackUserId,
+      volunteerSlackUserName: x['volunteer_slack_user_name'],
+    }));
+  } finally {
+    client.release();
+  }
+}
+
+// Return the needs_attention status for a specific thread
+export async function getThreadNeedsAttentionFor(
+  slackParentMessageTs: string,
+  slackChannelId: string
+): Promise<boolean> {
+  logger.info(`ENTERING DBAPIUTIL.getThreadNeedsAttentionFor`);
+  logger.info(
+    `DBAPIUTIL.getThreadNeedsAttentionFor: Looking up thread:${slackParentMessageTs}`
+  );
+
+  const client = await pool.connect();
+  try {
+    const result = await client.query(
+      'SELECT needs_attention FROM threads WHERE slack_parent_message_ts = $1 AND slack_channel_id = $2',
+      [slackParentMessageTs, slackChannelId]
+    );
+    logger.info(
+      `DBAPIUTIL.getMessageHistoryFor: Successfully looked up message history in PostgreSQL.`
+    );
+    if (result.rows.length > 0) {
+      return result.rows[0].needs_attention;
+    }
+    return false;
+  } finally {
+    client.release();
+  }
+}
+
+// Return a list of ThreadInfo's for all threads needing followup
+export async function getThreadsNeedingFollowUp(
+  slackUserId: string,
+  days: number
+): Promise<ThreadInfo[]> {
+  const client = await pool.connect();
+  try {
+    const result = await client.query(
+      `WITH latest_claims AS (
+        SELECT DISTINCT ON (user_id) user_id, volunteer_slack_user_id, volunteer_slack_user_name, is_demo
+        FROM volunteer_voter_claims
+        WHERE archived IS NOT TRUE
+        ORDER BY user_id, created_at DESC
+      ), latest_statuses AS (
+        SELECT DISTINCT ON (user_id) user_id, voter_status, is_demo
+        FROM voter_status_updates
+        ORDER BY user_id, created_at DESC
+      )
+      SELECT
+        t.slack_parent_message_ts
+        , t.slack_channel_id
+        , t.user_id
+        , EXTRACT(EPOCH FROM now() - updated_at) as last_update_age
+        , c.volunteer_slack_user_name
+        , s.voter_status
+        FROM threads t, latest_claims c, latest_statuses s
+        WHERE
+          active
+          AND updated_at <= NOW() - interval '${days} days'
+          AND t.user_id = c.user_id
+          AND t.is_demo = c.is_demo
+          AND c.volunteer_slack_user_id = $1
+          AND s.user_id = t.user_id
+          AND s.is_demo = t.is_demo
+          AND t.archived IS NOT TRUE
+        ORDER BY updated_at`,
+      [slackUserId]
+    );
+    return result.rows.map((x) => ({
+      slackParentMessageTs: x['slack_parent_message_ts'],
+      channelId: x['slack_channel_id'],
+      userId: x['user_id'],
+      lastUpdateAge: x['last_update_age'],
+      volunteerSlackUserId: slackUserId,
+      volunteerSlackUserName: x['volunteer_slack_user_name'],
+      voterStatus: x['voter_status'],
+    }));
+  } finally {
+    client.release();
+  }
+}
 export async function logVoterStatusToDb(
   databaseVoterStatusEntry: DatabaseVoterStatusEntry
 ): Promise<void> {
@@ -522,18 +1141,62 @@ export async function logVoterStatusToDb(
   }
 }
 
+export async function logInitialVoterStatusToDb(
+  userId: string,
+  userPhoneNumber: string,
+  twilioPhoneNumber: string,
+  isDemo: boolean
+): Promise<void> {
+  logger.info(`ENTERING DBAPIUTIL.logInitialVoterStatusToDb`);
+  const client = await pool.connect();
+  try {
+    if (process.env.CLIENT_ORGANIZATION === 'VOTE_AMERICA') {
+      // Only insert the UNKNOWN status if there is no existing status
+      await client.query(
+        `INSERT INTO voter_status_updates (user_id, user_phone_number, twilio_phone_number, voter_status, is_demo)
+        SELECT $1, $2, $3, 'UNKNOWN', $4
+        WHERE NOT EXISTS (
+          SELECT null FROM voter_status_updates
+          WHERE
+            user_id = $1
+            AND user_phone_number = $2
+            AND twilio_phone_number = $3
+            AND is_demo = $4
+            AND archived IS NOT TRUE
+        )`,
+        [userId, userPhoneNumber, twilioPhoneNumber, isDemo]
+      );
+    } else {
+      await client.query(
+        `INSERT INTO voter_status_updates (user_id, user_phone_number, twilio_phone_number, voter_status, is_demo)
+        VALUES ($1, $2, $3, 'UNKNOWN', $4)`,
+        [userId, userPhoneNumber, twilioPhoneNumber, isDemo]
+      );
+    }
+    logger.info(
+      `DBAPIUTIL.logInitialVoterStatusToDb: Successfully inserted initial voter status into PostgreSQL database.`
+    );
+  } finally {
+    client.release();
+  }
+}
+
 const LAST_VOTER_STATUS_SQL_SCRIPT = `SELECT voter_status
                                         FROM voter_status_updates
                                         WHERE user_id = $1
+                                          AND twilio_phone_number = $2
+                                          AND archived IS NOT TRUE
                                         ORDER BY created_at DESC
                                         LIMIT 1;`;
 
-// This used to be used to look up the latest voter status when moving a voter
+// This function is used for the "Already Voted" functionality.
+// History: This used to be used to look up the latest voter status when moving a voter
 // from channel to channel, but now instead the voter status is coded into
 // the block initial_option on the front-end, and is copied over with the blocks during the move.
 export async function getLatestVoterStatus(
-  userId: string
-): Promise<DatabaseVoterStatusEntry | null> {
+  userId: string,
+  twilioPhoneNumber: string
+): Promise<string | null> {
   logger.info(`ENTERING DBAPIUTIL.getLatest`);
   logger.info(
     `DBAPIUTIL.getLatestVoterStatus: Looking up last voter status for userId: ${userId}.`
@@ -541,15 +1204,19 @@ export async function getLatestVoterStatus(
   const client = await pool.connect();
 
   try {
-    const result = await client.query(LAST_VOTER_STATUS_SQL_SCRIPT, [userId]);
-
-    logger.info(
-      `DBAPIUTIL.getLatestVoterStatus: Successfully looked up last voter status.`
-    );
+    const result = await client.query(LAST_VOTER_STATUS_SQL_SCRIPT, [
+      userId,
+      twilioPhoneNumber,
+    ]);
     if (result.rows.length > 0) {
+      logger.info(
+        `DBAPIUTIL.getLatestVoterStatus: Successfully looked up last voter status.`
+      );
       return result.rows[0].voter_status;
     } else {
-      logger.error(`DBAPIUTIL.getLatestVoterStatus: No voter status for user`);
+      logger.error(
+        `DBAPIUTIL.getLatestVoterStatus: No voter status for user: userId: ${userId}, twilioPhoneNumber: ${twilioPhoneNumber}`
+      );
       return null;
     }
   } finally {
@@ -566,7 +1233,7 @@ export async function logVolunteerVoterClaimToDb(
 
   try {
     await client.query(
-      'INSERT INTO volunteer_voter_claims (user_id, user_phone_number, twilio_phone_number, is_demo, volunteer_slack_user_name, volunteer_slack_user_id, originating_slack_user_name, originating_slack_user_id, slack_channel_name, slack_channel_id, slack_parent_message_ts, action_ts) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12);',
+      'INSERT INTO volunteer_voter_claims (user_id, user_phone_number, twilio_phone_number, is_demo, volunteer_slack_user_name, volunteer_slack_user_id, originating_slack_user_name, originating_slack_user_id, slack_channel_name, slack_channel_id, slack_parent_message_ts, action_ts, archived) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, false);',
       [
         databaseVolunteerVoterClaimEntry.userId,
         databaseVolunteerVoterClaimEntry.userPhoneNumber,
@@ -586,6 +1253,19 @@ export async function logVolunteerVoterClaimToDb(
     logger.info(
       `DBAPIUTIL.logVolunteerVoterClaimToDb: Successfully inserted volunteer voter claim into PostgreSQL database.`
     );
+  } finally {
+    client.release();
+  }
+}
+
+export async function getVoterHasVolunteer(userId: string): Promise<boolean> {
+  const client = await pool.connect();
+  try {
+    const result = await client.query(
+      'SELECT EXISTS(SELECT 1 FROM volunteer_voter_claims WHERE user_id = $1 AND archived IS NOT TRUE) AS exists',
+      [userId]
+    );
+    return result.rows.length > 0 && result.rows[0]['exists'];
   } finally {
     client.release();
   }

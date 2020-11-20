@@ -26,7 +26,7 @@ export const makeVoterStatusMessageWithoutActionIds = () => ({
       elements: [
         {
           type: 'users_select',
-          action_id: '0+H2',
+          action_id: 'VOLUNTEER_DROPDOWN',
           initial_user: 'USLACKBOT',
           placeholder: {
             type: 'plain_text',
@@ -42,7 +42,7 @@ export const makeVoterStatusMessageWithoutActionIds = () => ({
       elements: [
         {
           type: 'static_select',
-          action_id: '0+H3',
+          action_id: 'VOTER_STATUS_DROPDOWN',
           initial_option: {
             text: {
               type: 'plain_text',
@@ -214,10 +214,8 @@ export const makeVoterStatusMessageWithActionIds = () => {
   message.blocks[1].elements[0].action_id = SlackActionId.VOLUNTEER_DROPDOWN;
   message.blocks[2].elements[0].action_id = SlackActionId.VOTER_STATUS_DROPDOWN;
   message.blocks[2].elements[1].action_id =
-    SlackActionId.VOTER_STATUS_VOTED_BUTTON;
-  message.blocks[2].elements[2].action_id =
     SlackActionId.VOTER_STATUS_REFUSED_BUTTON;
-  message.blocks[2].elements[3].action_id =
+  message.blocks[2].elements[2].action_id =
     SlackActionId.VOTER_STATUS_SPAM_BUTTON;
   return message;
 };

@@ -1,3 +1,5 @@
+import bluebird from 'bluebird';
+import { Multi } from 'redis';
 import logger from './logger';
 import type { PromisifiedRedisClient } from './redis_client';
 
@@ -86,6 +88,15 @@ export function deleteHashField(
   return redisClient.hdelAsync(key, field);
 }
 
+export function getKey(
+  redisClient: PromisifiedRedisClient,
+  key: string
+): Promise<string> {
+  logger.debug(`ENTERING REDISAPIUTIL.getKey`);
+
+  return redisClient.getAsync(key);
+}
+
 export function keysExist(
   redisClient: PromisifiedRedisClient,
   keys: string[]
@@ -102,4 +113,12 @@ export function deleteKeys(
   logger.debug(`ENTERING REDISAPIUTIL.deleteKeys`);
 
   return redisClient.delAsync(...keys);
+}
+
+export async function transactAsync(
+  redisClient: PromisifiedRedisClient,
+  callback: (multi: Multi) => Multi
+): Promise<any[]> {
+  const multi = callback(redisClient.multi());
+  return bluebird.promisify(multi.exec.bind(multi))();
 }

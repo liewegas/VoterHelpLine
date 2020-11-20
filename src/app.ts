@@ -6,7 +6,9 @@ import morgan from 'morgan';
 import axios, { AxiosResponse } from 'axios';
 import { Pool } from 'pg';
 
+import * as MessageConstants from './message_constants';
 import * as SlackApiUtil from './slack_api_util';
+import * as SlackInteractionHandler from './slack_interaction_handler';
 import * as TwilioApiUtil from './twilio_api_util';
 import * as Router from './router';
 import * as DbApiUtil from './db_api_util';
@@ -18,6 +20,7 @@ import * as SlackInteractionApiUtil from './slack_interaction_api_util';
 import * as SlackBlockUtil from './slack_block_util';
 import logger from './logger';
 import redisClient from './redis_client';
+import { SlackCallbackId } from './slack_interaction_ids';
 import { EntryPoint, Request, UserInfo } from './types';
 import {
   enqueueBackgroundTask,
@@ -25,6 +28,10 @@ import {
 } from './async_jobs';
 import { handleTwilioStatusCallback } from './twilio_status_callback_handler';
 import { SlackInteractionEventPayload } from './slack_interaction_handler';
+import { TwilioRequestBody } from './twilio_util';
+import * as KeywordParser from './keyword_parser';
+import { SlackActionId } from './slack_interaction_ids';
+import { VoterStatus } from './types';
 
 const app = express();
 
@@ -187,10 +194,11 @@ export async function handleKnownVoterBlockLogic(
     if ('activeChannelId' in userInfo) {
       // This includes a DB write of the message.
       await SlackApiUtil.sendMessage(
-        `*${userInfo.userId.substring(0, 5)}:* ${userMessage}`,
+        userMessage,
         {
           parentMessageTs: userInfo[userInfo.activeChannelId],
           channel: userInfo.activeChannelId,
+          isVoterMessage: true,
         },
         inboundDbMessageEntry,
         userInfo
@@ -217,7 +225,8 @@ const handleIncomingTwilioMessage = async (
 ) => {
   logger.info('Entering SERVER.handleIncomingTwilioMessage');
 
-  const userPhoneNumber = req.body.From;
+  const reqBody = req.body as TwilioRequestBody;
+  const userPhoneNumber = reqBody.From;
 
   const inboundTextsBlocked = await RedisApiUtil.getHashField(
     redisClient,
@@ -232,8 +241,9 @@ const handleIncomingTwilioMessage = async (
     return;
   }
 
-  const twilioPhoneNumber = req.body.To;
-  const userMessage = req.body.Body;
+  const twilioPhoneNumber = reqBody.To;
+  const userMessage = reqBody.Body;
+  const userAttachments = TwilioUtil.getAttachments(reqBody);
   const MD5 = new Hashes.MD5();
   const userId = MD5.hex(userPhoneNumber);
   logger.info(`SERVER.handleIncomingTwilioMessage: Receiving Twilio message from ${entryPoint} entry point voter,
@@ -246,7 +256,8 @@ const handleIncomingTwilioMessage = async (
     userMessage,
     userPhoneNumber,
     twilioPhoneNumber,
-    twilioMessageSid: req.body.SmsMessageSid,
+    twilioMessageSid: reqBody.SmsMessageSid,
+    twilioAttachments: userAttachments,
     entryPoint: LoadBalancer.PUSH_ENTRY_POINT,
   });
 
@@ -297,17 +308,18 @@ const handleIncomingTwilioMessage = async (
           .replace(/[^a-zA-Z]/g, '');
         if (userMessageNoPunctuation.startsWith('helpline')) {
           await Router.handleNewVoter(
-            { userPhoneNumber, userMessage, userId },
+            { userPhoneNumber, userMessage, userAttachments, userId },
             redisClient,
             twilioPhoneNumber,
             inboundDbMessageEntry,
             entryPoint,
-            twilioCallbackURL
+            twilioCallbackURL,
+            false /* includeWelcome */
           );
           return;
         } else {
           await Router.clarifyHelplineRequest(
-            { userInfo, userPhoneNumber, userMessage },
+            { userInfo, userPhoneNumber, userAttachments, userMessage },
             redisClient,
             twilioPhoneNumber,
             inboundDbMessageEntry,
@@ -330,7 +342,7 @@ const handleIncomingTwilioMessage = async (
       );
       // Don't do dislcaimer or U.S. state checks for push voters.
       await Router.handleClearedVoter(
-        { userInfo, userPhoneNumber, userMessage },
+        { userInfo, userAttachments, userPhoneNumber, userMessage },
         redisClient,
         twilioPhoneNumber,
         inboundDbMessageEntry,
@@ -347,6 +359,58 @@ const handleIncomingTwilioMessage = async (
       logger.info(
         `SERVER.handleIncomingTwilioMessage (${userId}): Voter has previously confirmed the disclaimer, or one is not required for this organization.`
       );
+
+      // always update the status if user texts VOTED
+      if (KeywordParser.isVotedKeyword(userMessage)) {
+        // log it
+        await DbApiUtil.logVoterStatusToDb({
+          userId: userInfo.userId,
+          userPhoneNumber: userInfo.userPhoneNumber,
+          twilioPhoneNumber: twilioPhoneNumber,
+          isDemo: userInfo.isDemo,
+          voterStatus: 'VOTED',
+          originatingSlackUserName: null,
+          originatingSlackUserId: null,
+          slackChannelName: null,
+          slackChannelId: null,
+          slackParentMessageTs: null,
+          actionTs: null,
+        });
+        await SlackApiUtil.sendMessage(
+          `*Operator:* Voter status changed to *VOTED* by user text.`,
+          {
+            channel: userInfo.activeChannelId,
+            parentMessageTs: userInfo[userInfo.activeChannelId],
+          }
+        );
+
+        // update blocks
+        let blocks = await SlackApiUtil.fetchSlackMessageBlocks(
+          userInfo.activeChannelId,
+          userInfo[userInfo.activeChannelId]
+        );
+        if (blocks) {
+          if (
+            !SlackBlockUtil.populateDropdownNewInitialValue(
+              blocks,
+              SlackActionId.VOTER_STATUS_DROPDOWN,
+              'VOTED' as VoterStatus
+            )
+          ) {
+            logger.error(
+              'ROUTER.handleClearedVoter: unable to modify status dropdown'
+            );
+          }
+          await SlackInteractionApiUtil.updateVoterStatusBlocks(
+            userInfo.activeChannelId,
+            userInfo[userInfo.activeChannelId],
+            blocks
+          );
+        } else {
+          logger.error('ROUTER.handleClearedVoter: unable to fetch old blocks');
+        }
+      }
+
       // Voter has a state determined. The U.S. state name is used for
       // operator messages as well as to know whether a U.S. state is known
       // for the voter. This may not be ideal (create separate bool?).
@@ -363,19 +427,46 @@ const handleIncomingTwilioMessage = async (
           `SERVER.handleIncomingTwilioMessage (${userId}): Known U.S. state for voter (${userInfo.stateName}) or volunteer has engaged (${userInfo.volunteerEngaged}). Automated system no longer active.`
         );
         await Router.handleClearedVoter(
-          { userInfo, userPhoneNumber, userMessage },
+          { userInfo, userPhoneNumber, userMessage, userAttachments },
           redisClient,
           twilioPhoneNumber,
           inboundDbMessageEntry,
           twilioCallbackURL
         );
+        // Voter texted VOTED during the state determination
+      } else if (KeywordParser.isVotedKeyword(userMessage)) {
+        await SlackApiUtil.sendMessage(
+          userMessage,
+          {
+            parentMessageTs: userInfo[userInfo.activeChannelId],
+            channel: userInfo.activeChannelId,
+            isVoterMessage: true,
+          },
+          inboundDbMessageEntry,
+          userInfo
+        );
+        const replyMessage = MessageConstants.VOTED_RESPONSE();
+        await TwilioApiUtil.sendMessage(
+          replyMessage,
+          {
+            userPhoneNumber: userPhoneNumber,
+            twilioPhoneNumber,
+            twilioCallbackURL,
+          },
+          DbApiUtil.populateAutomatedDbMessageEntry(userInfo)
+        );
+        await SlackApiUtil.sendMessage(replyMessage, {
+          parentMessageTs: userInfo[userInfo.activeChannelId],
+          channel: userInfo.activeChannelId,
+          isAutomatedMessage: true,
+        });
         // Voter has no state determined
       } else {
         logger.info(
           `SERVER.handleIncomingTwilioMessage (${userId}): U.S. state for voter is not known. Automated system will attempt to determine.`
         );
         await Router.determineVoterState(
-          { userInfo, userPhoneNumber, userMessage },
+          { userInfo, userPhoneNumber, userMessage, userAttachments },
           redisClient,
           twilioPhoneNumber,
           inboundDbMessageEntry,
@@ -390,7 +481,7 @@ const handleIncomingTwilioMessage = async (
         `SERVER.handleIncomingTwilioMessage (${userId}): Voter has NOT previously confirmed the disclaimer. Automated system will attempt to confirm.`
       );
       await Router.handleDisclaimer(
-        { userInfo, userPhoneNumber, userMessage },
+        { userInfo, userPhoneNumber, userMessage, userAttachments },
         redisClient,
         twilioPhoneNumber,
         inboundDbMessageEntry,
@@ -403,7 +494,7 @@ const handleIncomingTwilioMessage = async (
       `SERVER.handleIncomingTwilioMessage (${userId}): Voter is new to us (Redis returned no userInfo for redisHashKey ${redisHashKey})`
     );
 
-    if (userMessage.toLowerCase().trim() === 'stop') {
+    if (KeywordParser.isStopKeyword(userMessage)) {
       logger.info(
         `SERVER.handleIncomingTwilioMessage: Received STOP text from phone number: ${userPhoneNumber}.`
       );
@@ -422,17 +513,29 @@ const handleIncomingTwilioMessage = async (
     }
 
     if (process.env.CLIENT_ORGANIZATION === 'VOTE_AMERICA') {
-      await Router.welcomePotentialVoter(
-        { userPhoneNumber, userMessage, userId },
-        redisClient,
-        twilioPhoneNumber,
-        inboundDbMessageEntry,
-        entryPoint,
-        twilioCallbackURL
-      );
+      if (KeywordParser.isHelplineKeyword(userMessage)) {
+        await Router.handleNewVoter(
+          { userPhoneNumber, userMessage, userAttachments, userId },
+          redisClient,
+          twilioPhoneNumber,
+          inboundDbMessageEntry,
+          entryPoint,
+          twilioCallbackURL,
+          true /* includeWelcome */
+        );
+      } else {
+        await Router.welcomePotentialVoter(
+          { userPhoneNumber, userMessage, userAttachments, userId },
+          redisClient,
+          twilioPhoneNumber,
+          inboundDbMessageEntry,
+          entryPoint,
+          twilioCallbackURL
+        );
+      }
     } else {
       await Router.handleNewVoter(
-        { userPhoneNumber, userMessage, userId },
+        { userPhoneNumber, userMessage, userAttachments, userId },
         redisClient,
         twilioPhoneNumber,
         inboundDbMessageEntry,
@@ -549,7 +652,10 @@ app.post(
     // messages from the bot itself, hidden events, etc.
     if (
       reqBody.event.type === 'message' &&
-      reqBody.event.user != process.env.SLACK_BOT_USER_ID &&
+      // Most message include user id as event.user, but bot messages with
+      // a custom username include the user id as parent_user_id
+      (reqBody.event.user || reqBody.event.parent_user_id) !=
+        process.env.SLACK_BOT_USER_ID &&
       !reqBody.event.hidden
     ) {
       await enqueueBackgroundTask(
@@ -571,6 +677,44 @@ app.post(
     }
 
     res.sendStatus(200);
+  })
+);
+
+app.post(
+  '/slack-command',
+  runAsyncWrapper(async (req, res) => {
+    if (!SlackUtil.passesAuth(req)) {
+      logger.error(
+        'SERVER POST /slack-command: ERROR in authenticating request is from Slack.'
+      );
+      res.sendStatus(401);
+      return;
+    }
+    if (req.body.team_id != process.env.TEAM_ID) {
+      logger.error(
+        'SERVER POST /slack-command: Wrong team id ${req.body.team_id}'
+      );
+      res.sendStatus(401);
+      return;
+    }
+    logger.info('SERVER POST /slack-command: PASSES AUTH');
+
+    await enqueueBackgroundTask(
+      'slackCommandHandler',
+      req.body.channel_id,
+      req.body.channel_name,
+      req.body.user_id,
+      req.body.user_name,
+      req.body.command,
+      req.body.text,
+      req.body.response_url
+    );
+
+    // Use res.end instead of res.sendStatus because the latter sends the code as
+    // a string in the body, and modal responses require an empty body in some cases.
+    // See https://api.slack.com/surfaces/modals/using#close_current_view.
+    res.writeHead(200);
+    res.end();
   })
 );
 
@@ -602,31 +746,88 @@ app.post(
       return;
     }
 
+    let response: any;
+    let shouldEnqueueBackgroundTask = true;
+
     const payload: SlackInteractionEventPayload = JSON.parse(req.body.payload);
 
     const metadata: InteractivityHandlerMetadata = {};
 
     if (
-      payload.type === 'message_action' &&
-      payload.callback_id === 'reset_demo'
+      [
+        SlackCallbackId.RESET_DEMO,
+        SlackCallbackId.MANAGE_ENTRY_POINTS,
+        SlackCallbackId.SHOW_NEEDS_ATTENTION,
+      ].includes(payload.callback_id as SlackCallbackId)
     ) {
-      // For message actions, we always show a confirmation modal. Because we
-      // have to show this modal within 3 seconds, we immediately make the call
-      // to show a loading state, and then pass the modal ID on to the async
-      // task to update the modal
+      logger.info(
+        `SERVER POST /slack-interactivity: Determined ${payload.callback_id} opens a modal`
+      );
+
+      // For certain actions, we always show a modal. Because we have to show
+      // this modal within 3 seconds, we immediately make the call to show a
+      // loading state, and then pass the modal ID on to the async task to
+      // update the modal
       metadata.viewId = await SlackApiUtil.renderModal(
         payload.trigger_id,
         SlackBlockUtil.loadingSlackView()
       );
     }
 
-    await enqueueBackgroundTask('slackInteractivityHandler', payload, metadata);
+    if (
+      payload.type === 'view_submission' &&
+      (payload.view?.callback_id as SlackCallbackId) ===
+        SlackCallbackId.MANAGE_ENTRY_POINTS
+    ) {
+      // Check if we need to render a confirmation modal. This needs to happen
+      // synchronously to avoid 3 second timeout.
+      const confirmationModal = SlackInteractionHandler.maybeGetManageEntryPointsConfirmationModal(
+        payload
+      );
+      if (confirmationModal) {
+        logger.info(
+          `SERVER POST /slack-interactivity: Determined ${payload.view?.callback_id} pushes a view onto modal`
+        );
 
-    // Use res.end instead of res.sendStatus because the latter sends the code as
-    // a string in the body, and modal responses require an empty body in some cases.
-    // See https://api.slack.com/surfaces/modals/using#close_current_view.
-    res.writeHead(200);
-    res.end();
+        response = {
+          response_action: 'push',
+          view: confirmationModal,
+        };
+
+        shouldEnqueueBackgroundTask = false;
+      } else {
+        logger.info(
+          `SERVER POST /slack-interactivity: Determined ${payload.view?.callback_id} updates the view in modal`
+        );
+
+        // This will change, so show loading state again.
+        response = {
+          response_action: 'update',
+          view: SlackBlockUtil.loadingSlackView(),
+        };
+      }
+    }
+
+    // On AWS Lambda, returning a response will immediately pause execution. So it's
+    // important to enqueue the background task BEFORE responding with anything.
+    if (shouldEnqueueBackgroundTask) {
+      await enqueueBackgroundTask(
+        'slackInteractivityHandler',
+        payload,
+        metadata
+      );
+    }
+
+    if (response) {
+      // If there's an explicit response we want to send, use that
+      res.json(response);
+    } else {
+      // Use res.end instead of res.sendStatus because the latter sends the code as
+      // a string in the body, and modal responses require an empty body in some cases.
+      // See https://api.slack.com/surfaces/modals/using#close_current_view.
+      res.writeHead(200);
+      res.end();
+    }
   })
 );
 

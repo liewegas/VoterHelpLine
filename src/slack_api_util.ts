@@ -1,4 +1,5 @@
 import axios from 'axios';
+import axiosRetry from 'axios-retry';
 import Hashes from 'jshashes';
 import * as Sentry from '@sentry/node';
 import * as DbApiUtil from './db_api_util';
@@ -7,16 +8,25 @@ import { UserInfo } from './types';
 import { SlackBlock, SlackView } from './slack_block_util';
 import * as RedisApiUtil from './redis_api_util';
 import { PromisifiedRedisClient } from './redis_client';
+import { SlackFile } from './message_parser';
 
-const slackAPI = axios.create({
+export const slackAPI = axios.create({
   baseURL: 'https://slack.com/api/',
 });
+
 slackAPI.defaults.headers.post['Content-Type'] = 'application/json';
 slackAPI.defaults.headers.post[
   'Authorization'
 ] = `Bearer ${process.env.SLACK_BOT_ACCESS_TOKEN}`;
 
-type SlackSendMessageResponse = {
+axiosRetry(slackAPI, {
+  // This function is passed a retryCount which can be used to
+  // define custom retry delays.
+  retryDelay: () => 2000 /* millisecs between retries*/,
+  retries: 3,
+});
+
+export type SlackSendMessageResponse = {
   data: {
     channel: string;
     ts: string;
@@ -26,12 +36,134 @@ type SlackSendMessageResponse = {
 type SlackSendMessageOptions = {
   channel: string;
   parentMessageTs?: string;
+  parse?: boolean;
   blocks?: SlackBlock[];
+  isVoterMessage?: boolean;
+  isAutomatedMessage?: boolean;
 };
 
 type SlackChannelNamesAndIds = {
   [channelId: string]: string; // mapping of channel ID to channel name
 };
+
+export function linkToSlackChannel(
+  channelId: string,
+  channelName: string
+): string {
+  return `<slack://channel?team=${process.env.TEAM_ID}&id=${channelId}|#${channelName}>`;
+}
+
+export async function getThreadPermalink(
+  channel: string,
+  message_ts: string
+): Promise<string> {
+  try {
+    // Pick the newest message in the thread
+    const response = await slackAPI.get('chat.getPermalink', {
+      params: {
+        channel: channel,
+        message_ts: message_ts,
+        token: process.env.SLACK_BOT_ACCESS_TOKEN,
+      },
+    });
+    if (!response.data.ok) {
+      logger.error(
+        `SLACKAPIUTIL.getThreadPermalink: ERROR: ${JSON.stringify(
+          response.data
+        )}`
+      );
+    }
+    return response.data.permalink;
+  } catch (error) {
+    logger.error(`SLACKAPIUTIL.getThreadPermalink: ERROR in getting permalink message,
+                  channel: ${channel},
+                  message_ts: ${message_ts}`);
+    throw error;
+  }
+}
+
+function delay(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+export async function makeFilesPublic(files: SlackFile[]): Promise<string[]> {
+  const errors = [] as string[];
+  for (const file of files) {
+    // first post a permalink in a public channel so that anyone (namely,
+    // the bot) can make the file public
+    let response = await slackAPI.post('chat.postMessage', {
+      channel: process.env.ATTACHMENTS_SLACK_CHANNEL_ID || '',
+      text: file.permalink,
+      token: process.env.SLACK_BOT_ACCESS_TOKEN,
+      unfurl_media: true,
+      unfurl_links: true,
+    });
+    if (!response.data.ok) {
+      errors.push(`Unable to post permalink to attachments channel`);
+      logger.error(
+        `SLACKAPIUTIL.makeFilesPublic: unable to post permalink to channel: ${JSON.stringify(
+          response.data
+        )}`
+      );
+      continue;
+    }
+
+    await delay(2000);
+
+    // then make it public
+    response = await axios.post(
+      'https://slack.com/api/files.sharedPublicURL',
+      null,
+      {
+        params: {
+          file: file.id,
+          token: process.env.SLACK_USER_ACCESS_TOKEN,
+        },
+      }
+    );
+    if (!response.data.ok) {
+      errors.push('Unable to make attachment public');
+      logger.error(
+        `SLACKAPIUTIL.makeFilesPublic: Failed with ${JSON.stringify(
+          response.data
+        )}`
+      );
+    } else {
+      logger.info(
+        `SLACKAPIUTIL.makeFilesPublic: successfully made ${file.id} public`
+      );
+    }
+  }
+  return errors;
+}
+
+export async function sendEphemeralResponse(
+  url: string,
+  message: string
+): Promise<void> {
+  try {
+    const response = await axios.post(url, {
+      text: message,
+      token: process.env.SLACK_BOT_ACCESS_TOKEN,
+      unfurl_media: false,
+      unfurl_links: false,
+      response_type: 'ephemeral',
+    });
+    if (response.status != 200) {
+      throw new Error(
+        `SLACKAPIUTIL.sendEphemeralResponse: ERROR in sending Slack message: ${JSON.stringify(
+          response.data
+        )}`
+      );
+    }
+  } catch (error) {
+    logger.error(
+      `SLACKAPIUTIL.sendEphemeralResponse: ERROR in sending Slack response. Error data from Slack: ${JSON.stringify(
+        error
+      )}`
+    );
+    Sentry.captureException(error);
+  }
+}
 
 export async function sendMessage(
   message: string,
@@ -62,13 +194,25 @@ export async function sendMessage(
   }
 
   try {
-    const response = await slackAPI.post('chat.postMessage', {
+    const slackArgs = {
       channel: options.channel,
       text: message,
       token: process.env.SLACK_BOT_ACCESS_TOKEN,
       thread_ts: options.parentMessageTs,
       blocks: options.blocks,
-    });
+      unfurl_media: false,
+      unfurl_links: false,
+    } as { [key: string]: any };
+
+    if (options.isVoterMessage) {
+      slackArgs.username = `Voter ${userInfo?.userId.substring(0, 5)}`;
+      slackArgs.icon_emoji = ':bust_in_silhouette:';
+    } else if (options.isAutomatedMessage) {
+      slackArgs.username = `Helpline (Automated)`;
+      slackArgs.icon_emoji = ':gear:';
+    }
+
+    const response = await slackAPI.post('chat.postMessage', slackArgs);
 
     if (!response.data.ok) {
       logger.error(
@@ -95,6 +239,7 @@ export async function sendMessage(
 
       try {
         await DbApiUtil.logMessageToDb(databaseMessageEntry);
+        await DbApiUtil.updateThreadStatusFromMessage(databaseMessageEntry);
       } catch (error) {
         logger.info(
           `SLACKAPIUTIL.sendMessage: failed to log message send success to DB`
@@ -308,7 +453,7 @@ export async function fetchSlackChannelNamesAndIds(): Promise<SlackChannelNamesA
 
 export async function updateSlackChannelNamesAndIdsInRedis(
   redisClient: PromisifiedRedisClient
-): Promise<void> {
+): Promise<SlackChannelNamesAndIds | null> {
   logger.info(`ENTERING SLACKAPIUTIL.updateSlackChannelNamesAndIdsInRedis`);
   const slackChannelNamesAndIds = await fetchSlackChannelNamesAndIds();
 
@@ -319,6 +464,20 @@ export async function updateSlackChannelNamesAndIdsInRedis(
       slackChannelNamesAndIds
     );
   }
+
+  return slackChannelNamesAndIds;
+}
+
+// Get Slack Channel Name / ID map, populating cache if needed
+export async function getSlackChannelNamesAndIds(
+  redisClient: PromisifiedRedisClient
+): Promise<SlackChannelNamesAndIds | null> {
+  const slackChannelIds = await RedisApiUtil.getHash(
+    redisClient,
+    'slackPodChannelIds'
+  );
+  if (slackChannelIds) return slackChannelIds;
+  return updateSlackChannelNamesAndIdsInRedis(redisClient);
 }
 
 export async function addSlackMessageReaction(
@@ -336,6 +495,35 @@ export async function addSlackMessageReaction(
     throw new Error(
       `SLACKAPIUTIL.addSlackMessageReaction: ERROR in adding reaction: ${response.data.error}`
     );
+  }
+}
+
+export async function isMemberOfAdminChannel(
+  slackUserId: string
+): Promise<boolean> {
+  const channelId = process.env.ADMIN_CONTROL_ROOM_SLACK_CHANNEL_ID;
+
+  // TODO: Consider caching this data. For now, calling every time is the best
+  // way to maintain security though.
+  const response = await slackAPI.get('conversations.members', {
+    params: {
+      channel: channelId,
+      token: process.env.SLACK_BOT_ACCESS_TOKEN,
+    },
+  });
+
+  if (response.data.ok) {
+    logger.info(
+      `SLACKAPIUTIL.isMemberOfAdminChannel: Successfully called isMemberOfAdminChannel`
+    );
+    return response.data.members.includes(slackUserId);
+  } else {
+    logger.error(
+      `SLACKAPIUTIL.isMemberOfAdminChannel: Failed to call conversations.members for ${channelId}. Error: response.data: ${JSON.stringify(
+        response.data
+      )}`
+    );
+    return false;
   }
 }
 
